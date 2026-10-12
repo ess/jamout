@@ -56,6 +56,7 @@ struct JamOutApp {
 
     // Live plugin / synth editor modal
     pub edit_track_id: Option<String>,
+    pub edit_insert_slot: Option<(String, usize)>, // (track_id, insert_index)
     pub preset_save_name: String,
     pub param_search_filter: String,
 
@@ -280,6 +281,7 @@ impl JamOutApp {
             piano_roll_note_pitch: 50, // D3 default
             track_name_edits: HashMap::new(),
             edit_track_id: None,
+            edit_insert_slot: None,
             preset_save_name: "custom_patch.json".to_string(),
             param_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
@@ -741,28 +743,15 @@ impl eframe::App for JamOutApp {
                                                         insert_index: ins_idx,
                                                     });
                                                     self.status_msg = format!("Removed insert effect '{}'", ins.name);
+                                                    if self.edit_insert_slot == Some((track.id.clone(), ins_idx)) {
+                                                        self.edit_insert_slot = None;
+                                                    }
+                                                }
+                                                if ui.small_button("🎛").on_hover_text("Open Effect Controls in dedicated popout window").clicked() {
+                                                    self.edit_insert_slot = Some((track.id.clone(), ins_idx));
                                                 }
                                             });
                                         });
-
-                                        if !ins.params.is_empty() {
-                                            ui.collapsing(format!("Parameters ({})", ins.params.len()), |ui| {
-                                                for p in &ins.params {
-                                                    let mut val = p.value;
-                                                    ui.horizontal(|ui| {
-                                                        ui.set_min_width(110.0);
-                                                        ui.small(&p.name);
-                                                        if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
-                                                            self.send_cmd(IpcCommand::SetTrackParam {
-                                                                track_id: track.id.clone(),
-                                                                param_name: p.name.clone(),
-                                                                value: val,
-                                                            });
-                                                        }
-                                                    });
-                                                }
-                                            });
-                                        }
                                     });
                                 }
                             }
@@ -774,6 +763,62 @@ impl eframe::App for JamOutApp {
                 }
             } else {
                 self.edit_track_id = None;
+            }
+        }
+
+        // Dedicated Effect Plugin Popout Modal
+        if let Some((ref tr_id, ins_idx)) = self.edit_insert_slot.clone() {
+            let insert_info_opt = self.last_status.as_ref().and_then(|s| {
+                s.tracks.iter().find(|t| t.id == *tr_id).and_then(|t| {
+                    t.inserts.get(ins_idx).cloned().map(|ins| (t.name.clone(), ins))
+                })
+            });
+
+            if let Some((track_name, ins)) = insert_info_opt {
+                let mut is_effect_open = true;
+                egui::Window::new(format!("⚡ Effect: {} (Track: {})", ins.name, track_name))
+                    .open(&mut is_effect_open)
+                    .resizable(true)
+                    .default_width(340.0)
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -40.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!("Plugin: {}", ins.name));
+                        ui.small(format!("URI: {}", ins.uri));
+                        ui.separator();
+
+                        if ins.params.is_empty() {
+                            ui.label("No exposed control parameters for this plugin.");
+                        } else {
+                            ui.label(format!("Parameters ({})", ins.params.len()));
+                            ui.add_space(4.0);
+
+                            egui::ScrollArea::vertical()
+                                .max_height(350.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for p in &ins.params {
+                                        let mut val = p.value;
+                                        ui.horizontal(|ui| {
+                                            ui.set_min_width(120.0);
+                                            ui.label(&p.name);
+                                            if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
+                                                self.send_cmd(IpcCommand::SetTrackParam {
+                                                    track_id: tr_id.clone(),
+                                                    param_name: p.name.clone(),
+                                                    value: val,
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+                        }
+                    });
+
+                if !is_effect_open {
+                    self.edit_insert_slot = None;
+                }
+            } else {
+                self.edit_insert_slot = None;
             }
         }
     }
