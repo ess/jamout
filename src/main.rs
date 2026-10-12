@@ -761,16 +761,16 @@ impl JamOutApp {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.set_min_height(48.0);
-                        // Strict fixed-width Track Header (180px) so lanes never get offset by label length
-                        ui.allocate_ui(egui::vec2(180.0, 42.0), |ui| {
-                            ui.set_width(180.0);
-                            ui.set_max_width(180.0);
+                        // Strict fixed-width Track Header (220px) so lanes never get offset by label length
+                        ui.allocate_ui(egui::vec2(220.0, 42.0), |ui| {
+                            ui.set_width(220.0);
+                            ui.set_max_width(220.0);
                             ui.vertical(|ui| {
                                 let (need_rename, new_name_str) = {
                                     let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
                                     let resp = ui.add(
                                         egui::TextEdit::singleline(current_buf)
-                                            .desired_width(170.0)
+                                            .desired_width(210.0)
                                             .hint_text("Track Name")
                                     );
                                     if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
@@ -788,20 +788,20 @@ impl JamOutApp {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.small(&format!("ID: {}", track.id));
-                                    if ui.small_button("🎹").on_hover_text("Open Piano Roll").clicked() {
+                                    if ui.small_button("Roll").on_hover_text("Open Piano Roll").clicked() {
                                         self.selected_track_id = track.id.clone();
                                         self.active_tab = Tab::PianoRoll;
                                     }
-                                    if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP").clicked() {
+                                    if ui.small_button("DSP").on_hover_text("Tweak Instruments & DSP Parameters").clicked() {
                                         self.edit_track_id = Some(track.id.clone());
                                     }
-                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
+                                    if idx > 0 && ui.small_button("Up").on_hover_text("Move track up").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
                                     }
-                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
+                                    if idx + 1 < tracks.len() && ui.small_button("Dn").on_hover_text("Move track down").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
                                     }
-                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                    if ui.small_button("Del").on_hover_text("Delete track").clicked() {
                                         self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
                                         self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
@@ -1072,16 +1072,16 @@ impl JamOutApp {
                     ui.horizontal(|ui| {
                         ui.set_min_height(48.0);
 
-                        // Track Header (Fixed 180px width to match timeline)
-                        ui.allocate_ui(egui::vec2(180.0, 44.0), |ui| {
-                            ui.set_width(180.0);
-                            ui.set_max_width(180.0);
+                        // Track Header (Fixed 220px width to match timeline)
+                        ui.allocate_ui(egui::vec2(220.0, 44.0), |ui| {
+                            ui.set_width(220.0);
+                            ui.set_max_width(220.0);
                             ui.vertical(|ui| {
                                 let (need_rename, new_name_str) = {
                                     let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
                                     let resp = ui.add(
                                         egui::TextEdit::singleline(current_buf)
-                                            .desired_width(170.0)
+                                            .desired_width(210.0)
                                             .hint_text("Track Name")
                                     );
                                     if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
@@ -1099,16 +1099,16 @@ impl JamOutApp {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.small(&format!("ID: {}", track.id));
-                                    if ui.small_button("🎛").on_hover_text("Open DSP / Synth Parameter Controls").clicked() {
+                                    if ui.small_button("DSP").on_hover_text("Open DSP / Synth Parameter Controls").clicked() {
                                         self.edit_track_id = Some(track.id.clone());
                                     }
-                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
+                                    if idx > 0 && ui.small_button("Up").on_hover_text("Move track up").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
                                     }
-                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
+                                    if idx + 1 < tracks.len() && ui.small_button("Dn").on_hover_text("Move track down").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
                                     }
-                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                    if ui.small_button("Del").on_hover_text("Delete track").clicked() {
                                         self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
                                         self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
