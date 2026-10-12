@@ -24,7 +24,7 @@ fn main() -> eframe::Result<()> {
 }
 
 struct JamOutApp {
-    socket_path: String,
+    _socket_path: String,
     connected: bool,
     last_status: Option<IpcStatusResponse>,
     cmd_sender: Sender<IpcCommand>,
@@ -33,7 +33,7 @@ struct JamOutApp {
     // UI state
     record_out_filename: String,
     status_msg: String,
-    status_time: Instant,
+    _status_time: Instant,
     active_tab: Tab,
     lyrics: Vec<LyricLine>,
 
@@ -207,14 +207,14 @@ impl JamOutApp {
         ];
 
         Self {
-            socket_path,
+            _socket_path: socket_path,
             connected: false,
             last_status: None,
             cmd_sender: cmd_tx,
             status_receiver: status_rx,
             record_out_filename: "takes/vocal_verse1_take1.wav".to_string(),
             status_msg: "Ready. Connect jamseq via /tmp/jamseq.sock".to_string(),
-            status_time: Instant::now(),
+            _status_time: Instant::now(),
             active_tab: Tab::Timeline,
             lyrics,
             drift_ticks: 20,       // ±20 ticks Gaussian feel
@@ -481,44 +481,20 @@ impl eframe::App for JamOutApp {
                         ui.small(format!("Track ID: {} | Live DSP Control", track.id));
                         ui.separator();
 
-                        // Dynamic Plugin / Synth Switcher
+                        // Dynamic Plugin / Instrument Switcher
                         ui.horizontal(|ui| {
                             ui.label("Active Instrument:");
-                            let current_plug = track.current_plugin.as_deref().unwrap_or("JamSynth (Built-in)");
+                            let current_plug = track.current_plugin.as_deref().unwrap_or("None");
 
                             egui::ComboBox::from_id_salt(format!("plugin_sel_{}", track.id))
                                 .selected_text(current_plug)
                                 .show_ui(ui, |ui| {
-                                    ui.label("--- JamSynth Presets ---");
-                                    if ui.selectable_label(current_plug == "JamSynth (Sub 808)", "Sub 808 Bass").clicked() {
-                                        self.send_cmd(IpcCommand::SwitchTrackPlugin {
-                                            track_id: track.id.clone(),
-                                            plugin_uri_or_type: "synth:808".to_string(),
-                                            plugin_name: "JamSynth (Sub 808)".to_string(),
-                                        });
-                                    }
-                                    if ui.selectable_label(current_plug == "JamSynth (Dark Reese)", "Dark Reese Bass").clicked() {
-                                        self.send_cmd(IpcCommand::SwitchTrackPlugin {
-                                            track_id: track.id.clone(),
-                                            plugin_uri_or_type: "synth:reese".to_string(),
-                                            plugin_name: "JamSynth (Dark Reese)".to_string(),
-                                        });
-                                    }
-                                    if ui.selectable_label(current_plug == "JamSynth (Cold Pad)", "Cold Pad (Synth)").clicked() {
-                                        self.send_cmd(IpcCommand::SwitchTrackPlugin {
-                                            track_id: track.id.clone(),
-                                            plugin_uri_or_type: "synth:pad".to_string(),
-                                            plugin_name: "JamSynth (Cold Pad)".to_string(),
-                                        });
-                                    }
-
                                     let available = self.last_status.as_ref()
                                         .map(|s| s.available_plugins.clone())
                                         .unwrap_or_default();
 
                                     if !available.is_empty() {
-                                        ui.separator();
-                                        ui.label("--- Scanned System Plugins (LV2 / CLAP) ---");
+                                        ui.label("--- Available Plugins (CLAP / LV2) ---");
                                         for plug in &available {
                                             let display = format!("{} ({})", plug.name, plug.plugin_format);
                                             let is_selected = current_plug == display;
@@ -531,7 +507,6 @@ impl eframe::App for JamOutApp {
                                             }
                                         }
                                     } else {
-                                        ui.separator();
                                         ui.label("(No system LV2/CLAP plugins found)");
                                     }
 
@@ -614,6 +589,32 @@ impl eframe::App for JamOutApp {
                             ui.add_space(8.0);
                             ui.separator();
                             ui.label("💾 Preset Management:");
+                            if track.current_plugin.as_deref().map(|p| p.to_lowercase().contains("jamsynth")).unwrap_or(false) {
+                                ui.horizontal(|ui| {
+                                    ui.label("Quick Presets:");
+                                    if ui.button("808 Sub").clicked() {
+                                        self.send_cmd(IpcCommand::LoadTrackPreset {
+                                            track_id: track.id.clone(),
+                                            preset_name: "808_sub.json".to_string(),
+                                        });
+                                        self.status_msg = "Loaded 808 Sub preset".to_string();
+                                    }
+                                    if ui.button("Dark Reese").clicked() {
+                                        self.send_cmd(IpcCommand::LoadTrackPreset {
+                                            track_id: track.id.clone(),
+                                            preset_name: "dark_reese.json".to_string(),
+                                        });
+                                        self.status_msg = "Loaded Dark Reese preset".to_string();
+                                    }
+                                    if ui.button("Cold Pad").clicked() {
+                                        self.send_cmd(IpcCommand::LoadTrackPreset {
+                                            track_id: track.id.clone(),
+                                            preset_name: "cold_gothic_pad.json".to_string(),
+                                        });
+                                        self.status_msg = "Loaded Cold Pad preset".to_string();
+                                    }
+                                });
+                            }
                             ui.horizontal(|ui| {
                                 ui.label("File:");
                                 ui.text_edit_singleline(&mut self.preset_save_name);
