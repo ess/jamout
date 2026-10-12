@@ -972,6 +972,7 @@ impl JamOutApp {
 
         let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
         let master_vol = self.last_status.as_ref().map(|s| s.master_volume).unwrap_or(0.9);
+        let master_peak = self.last_status.as_ref().map(|s| s.master_peak).unwrap_or(0.0);
 
         // --- 1. MASTER BUS ROW (Anchored at top) ---
         ui.group(|ui| {
@@ -990,7 +991,7 @@ impl JamOutApp {
 
                 ui.separator();
 
-                // Master Volume Fader (Horizontal slider)
+                // Master Volume Fader
                 ui.vertical(|ui| {
                     let mut m_vol = master_vol;
                     let db_str = if m_vol <= 0.0001 {
@@ -1004,10 +1005,32 @@ impl JamOutApp {
                         ui.monospace(&db_str);
                     });
 
-                    let slider_width = (ui.available_width() - 30.0).max(120.0);
-                    if ui.add_sized([slider_width, 20.0], egui::Slider::new(&mut m_vol, 0.0..=1.5).text("").show_value(false)).changed() {
+                    let fader_width = (ui.available_width() - 120.0).max(80.0);
+                    if ui.add_sized([fader_width, 20.0], egui::Slider::new(&mut m_vol, 0.0..=1.5).text("").show_value(false)).changed() {
                         self.send_cmd(IpcCommand::SetMasterVolume { volume: m_vol });
                     }
+                });
+
+                ui.separator();
+
+                // Master VU Peak Meter
+                ui.allocate_ui(egui::vec2(90.0, 40.0), |ui| {
+                    ui.vertical(|ui| {
+                        let peak_db = if master_peak <= 0.0001 {
+                            "-inf dB".to_string()
+                        } else {
+                            format!("{:.1} dB", 20.0 * master_peak.log10())
+                        };
+                        ui.horizontal(|ui| {
+                            ui.small("VU Peak:");
+                            ui.monospace(peak_db);
+                        });
+                        let vu_pct = master_peak.clamp(0.0, 1.2) / 1.2;
+                        let pb = egui::ProgressBar::new(vu_pct.min(1.0))
+                            .desired_width(85.0)
+                            .animate(false);
+                        ui.add(pb);
+                    });
                 });
             });
         });
@@ -1126,7 +1149,7 @@ impl JamOutApp {
 
                         ui.separator();
 
-                        // Volume Fader (Remaining horizontal width)
+                        // Volume Fader
                         ui.vertical(|ui| {
                             let mut vol = track.volume;
                             let db_str = if vol <= 0.0001 {
@@ -1138,13 +1161,35 @@ impl JamOutApp {
                                 ui.label("Volume:");
                                 ui.monospace(&db_str);
                             });
-                            let slider_width = (ui.available_width() - 20.0).max(100.0);
+                            let slider_width = (ui.available_width() - 110.0).max(60.0);
                             if ui.add_sized([slider_width, 20.0], egui::Slider::new(&mut vol, 0.0..=1.5).show_value(false)).on_hover_text("Track channel volume").changed() {
                                 self.send_cmd(IpcCommand::SetVolume {
                                     track_id: track.id.clone(),
                                     volume: vol,
                                 });
                             }
+                        });
+
+                        ui.separator();
+
+                        // Track Channel VU Peak Meter
+                        ui.allocate_ui(egui::vec2(90.0, 44.0), |ui| {
+                            ui.vertical(|ui| {
+                                let peak_db = if track.peak_level <= 0.0001 {
+                                    "-inf dB".to_string()
+                                } else {
+                                    format!("{:.1} dB", 20.0 * track.peak_level.log10())
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.small("VU:");
+                                    ui.monospace(peak_db);
+                                });
+                                let vu_pct = track.peak_level.clamp(0.0, 1.2) / 1.2;
+                                let pb = egui::ProgressBar::new(vu_pct.min(1.0))
+                                    .desired_width(85.0)
+                                    .animate(false);
+                                ui.add(pb);
+                            });
                         });
                     });
                 });
