@@ -694,6 +694,78 @@ impl eframe::App for JamOutApp {
                                     self.status_msg = format!("Loaded preset from {}", self.preset_save_name);
                                 }
                             });
+
+                            ui.add_space(8.0);
+                            ui.separator();
+
+                            // --- INSERT EFFECTS CHAIN SECTION ---
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("⚡ Insert Effects Chain").strong());
+
+                                egui::ComboBox::from_id_salt(format!("add_insert_sel_{}", track.id))
+                                    .selected_text("➕ Add Effect...")
+                                    .show_ui(ui, |ui| {
+                                        let available = self.last_status.as_ref()
+                                            .map(|s| s.available_plugins.clone())
+                                            .unwrap_or_default();
+
+                                        if !available.is_empty() {
+                                            for plug in &available {
+                                                let display = format!("{} ({})", plug.name, plug.plugin_format);
+                                                if ui.button(&display).clicked() {
+                                                    self.send_cmd(IpcCommand::AddTrackInsert {
+                                                        track_id: track.id.clone(),
+                                                        plugin_uri_or_path: plug.uri_or_path.clone(),
+                                                        plugin_name: display.clone(),
+                                                    });
+                                                    self.status_msg = format!("Added insert effect '{}'", display);
+                                                }
+                                            }
+                                        } else {
+                                            ui.label("(No system plugins available)");
+                                        }
+                                    });
+                            });
+
+                            if track.inserts.is_empty() {
+                                ui.small("No insert effects on this track. Add effects like Reverb, Delay, or Guitar Amp above.");
+                            } else {
+                                for (ins_idx, ins) in track.inserts.iter().enumerate() {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.strong(format!("{}. {}", ins_idx + 1, ins.name));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("🗑").on_hover_text("Remove this insert effect").clicked() {
+                                                    self.send_cmd(IpcCommand::RemoveTrackInsert {
+                                                        track_id: track.id.clone(),
+                                                        insert_index: ins_idx,
+                                                    });
+                                                    self.status_msg = format!("Removed insert effect '{}'", ins.name);
+                                                }
+                                            });
+                                        });
+
+                                        if !ins.params.is_empty() {
+                                            ui.collapsing(format!("Parameters ({})", ins.params.len()), |ui| {
+                                                for p in &ins.params {
+                                                    let mut val = p.value;
+                                                    ui.horizontal(|ui| {
+                                                        ui.set_min_width(110.0);
+                                                        ui.small(&p.name);
+                                                        if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
+                                                            self.send_cmd(IpcCommand::SetTrackParam {
+                                                                track_id: track.id.clone(),
+                                                                param_name: p.name.clone(),
+                                                                value: val,
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                            }
                         }
                     });
 
