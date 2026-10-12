@@ -78,7 +78,59 @@ struct LyricLine {
 }
 
 impl JamOutApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Load fallback icon fonts (FontAwesome and Noto Symbols) into egui
+        let mut fonts = egui::FontDefinitions::default();
+        if let Ok(fa_bytes) = std::fs::read("/usr/share/fonts/opentype/font-awesome/FontAwesome.otf") {
+            fonts.font_data.insert(
+                "FontAwesome".to_owned(),
+                egui::FontData::from_owned(fa_bytes).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("FontAwesome".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("FontAwesome".to_owned());
+        }
+        if let Ok(noto_sym_bytes) = std::fs::read("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf") {
+            fonts.font_data.insert(
+                "NotoSymbols2".to_owned(),
+                egui::FontData::from_owned(noto_sym_bytes).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("NotoSymbols2".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("NotoSymbols2".to_owned());
+        }
+        if let Ok(liberation_bytes) = std::fs::read("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf") {
+            fonts.font_data.insert(
+                "LiberationSans".to_owned(),
+                egui::FontData::from_owned(liberation_bytes).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("LiberationSans".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("LiberationSans".to_owned());
+        }
+        cc.egui_ctx.set_fonts(fonts);
+
         let (cmd_tx, cmd_rx) = channel::<IpcCommand>();
         let (status_tx, status_rx) = channel::<IpcStatusResponse>();
 
@@ -788,20 +840,20 @@ impl JamOutApp {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.small(&format!("ID: {}", track.id));
-                                    if ui.small_button("Roll").on_hover_text("Open Piano Roll").clicked() {
+                                    if ui.small_button("🎹").on_hover_text("Open Piano Roll").clicked() {
                                         self.selected_track_id = track.id.clone();
                                         self.active_tab = Tab::PianoRoll;
                                     }
-                                    if ui.small_button("DSP").on_hover_text("Tweak Instruments & DSP Parameters").clicked() {
+                                    if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP Parameters").clicked() {
                                         self.edit_track_id = Some(track.id.clone());
                                     }
-                                    if idx > 0 && ui.small_button("Up").on_hover_text("Move track up").clicked() {
+                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
                                     }
-                                    if idx + 1 < tracks.len() && ui.small_button("Dn").on_hover_text("Move track down").clicked() {
+                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
                                     }
-                                    if ui.small_button("Del").on_hover_text("Delete track").clicked() {
+                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
                                         self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
                                         self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
@@ -1099,16 +1151,16 @@ impl JamOutApp {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.small(&format!("ID: {}", track.id));
-                                    if ui.small_button("DSP").on_hover_text("Open DSP / Synth Parameter Controls").clicked() {
+                                    if ui.small_button("🎛").on_hover_text("Open DSP / Synth Parameter Controls").clicked() {
                                         self.edit_track_id = Some(track.id.clone());
                                     }
-                                    if idx > 0 && ui.small_button("Up").on_hover_text("Move track up").clicked() {
+                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
                                     }
-                                    if idx + 1 < tracks.len() && ui.small_button("Dn").on_hover_text("Move track down").clicked() {
+                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
                                         self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
                                     }
-                                    if ui.small_button("Del").on_hover_text("Delete track").clicked() {
+                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
                                         self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
                                         self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
