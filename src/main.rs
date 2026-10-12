@@ -1,5 +1,8 @@
+mod sliding_panel;
+
 use eframe::egui;
 use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse};
+use sliding_panel::SlidingPanelStack;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -56,6 +59,7 @@ struct JamOutApp {
 
     // Live plugin / synth editor modal
     pub edit_track_id: Option<String>,
+    pub edit_insert_slot: Option<(String, usize)>, // (track_id, insert_index)
     pub preset_save_name: String,
     pub param_search_filter: String,
 
@@ -78,7 +82,59 @@ struct LyricLine {
 }
 
 impl JamOutApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Load fallback icon fonts (FontAwesome and Noto Symbols) into egui
+        let mut fonts = egui::FontDefinitions::default();
+        if let Ok(fa_bytes) = std::fs::read("/usr/share/fonts/opentype/font-awesome/FontAwesome.otf") {
+            fonts.font_data.insert(
+                "FontAwesome".to_owned(),
+                egui::FontData::from_owned(fa_bytes).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("FontAwesome".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("FontAwesome".to_owned());
+        }
+        if let Ok(noto_sym_bytes) = std::fs::read("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf") {
+            fonts.font_data.insert(
+                "NotoSymbols2".to_owned(),
+                egui::FontData::from_owned(noto_sym_bytes).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("NotoSymbols2".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("NotoSymbols2".to_owned());
+        }
+        if let Ok(liberation_bytes) = std::fs::read("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf") {
+            fonts.font_data.insert(
+                "LiberationSans".to_owned(),
+                egui::FontData::from_owned(liberation_bytes).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("LiberationSans".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("LiberationSans".to_owned());
+        }
+        cc.egui_ctx.set_fonts(fonts);
+
         let (cmd_tx, cmd_rx) = channel::<IpcCommand>();
         let (status_tx, status_rx) = channel::<IpcStatusResponse>();
 
@@ -228,6 +284,7 @@ impl JamOutApp {
             piano_roll_note_pitch: 50, // D3 default
             track_name_edits: HashMap::new(),
             edit_track_id: None,
+            edit_insert_slot: None,
             preset_save_name: "custom_patch.json".to_string(),
             param_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
@@ -325,10 +382,17 @@ impl eframe::App for JamOutApp {
 
                 ui.separator();
 
-                // Tempo and Time display
+                // Tempo, Time Signature, and Bar/Beat display
                 let current_bar = (current_tick / (4 * 960)) + 1;
                 let current_beat = ((current_tick % (4 * 960)) / 960) + 1;
-                ui.monospace(format!("Bar {:02} : {:02} | {:.1} BPM", current_bar, current_beat, bpm));
+                let active_meter = self.last_status.as_ref()
+                    .and_then(|s| {
+                        let cur_id = s.active_section_id.as_deref();
+                        s.sections.iter().find(|sec| cur_id == Some(&sec.id))
+                            .map(|sec| format!("{}/{}", sec.time_signature.numerator, sec.time_signature.denominator))
+                    })
+                    .unwrap_or_else(|| "4/4".to_string());
+                ui.monospace(format!("Bar {:02} : {:02} | {} | {:.1} BPM", current_bar, current_beat, active_meter, bpm));
 
                 ui.separator();
 
@@ -450,12 +514,13 @@ impl eframe::App for JamOutApp {
 
             if let Some(track) = track_opt {
                 let mut is_open = true;
-                egui::Window::new(format!("🎛 Tweak Instrument: {}", track.name))
-                    .open(&mut is_open)
-                    .resizable(true)
-                    .default_width(320.0)
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-20.0, 50.0))
-                    .show(ctx, |ui| {
+                let mut root_stack = SlidingPanelStack::docked_left(44.0);
+                let inst_rect = root_stack.panel(
+                    ctx,
+                    egui::Id::new("instrument_inspector_window"),
+                    format!("🎛 Tweak Instrument: {}", track.name),
+                    &mut is_open,
+                    |ui| {
                         ui.horizontal(|ui| {
                             let (need_rename, new_name_str) = {
                                 let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
@@ -635,15 +700,146 @@ impl eframe::App for JamOutApp {
                                     self.status_msg = format!("Loaded preset from {}", self.preset_save_name);
                                 }
                             });
+
+                            ui.add_space(8.0);
+                            ui.separator();
+
+                            // --- INSERT EFFECTS CHAIN SECTION ---
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("⚡ Insert Effects Chain").strong());
+
+                                egui::ComboBox::from_id_salt(format!("add_insert_sel_{}", track.id))
+                                    .selected_text("➕ Add Effect...")
+                                    .show_ui(ui, |ui| {
+                                        let available = self.last_status.as_ref()
+                                            .map(|s| s.available_plugins.clone())
+                                            .unwrap_or_default();
+
+                                        if !available.is_empty() {
+                                            for plug in &available {
+                                                let display = format!("{} ({})", plug.name, plug.plugin_format);
+                                                if ui.button(&display).clicked() {
+                                                    self.send_cmd(IpcCommand::AddTrackInsert {
+                                                        track_id: track.id.clone(),
+                                                        plugin_uri_or_path: plug.uri_or_path.clone(),
+                                                        plugin_name: display.clone(),
+                                                    });
+                                                    self.status_msg = format!("Added insert effect '{}'", display);
+                                                }
+                                            }
+                                        } else {
+                                            ui.label("(No system plugins available)");
+                                        }
+                                    });
+                            });
+
+                            if track.inserts.is_empty() {
+                                ui.small("No insert effects on this track. Add effects like Reverb, Delay, or Guitar Amp above.");
+                            } else {
+                                for (ins_idx, ins) in track.inserts.iter().enumerate() {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.strong(format!("{}. {}", ins_idx + 1, ins.name));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("🗑").on_hover_text("Remove this insert effect").clicked() {
+                                                    self.send_cmd(IpcCommand::RemoveTrackInsert {
+                                                        track_id: track.id.clone(),
+                                                        insert_index: ins_idx,
+                                                    });
+                                                    self.status_msg = format!("Removed insert effect '{}'", ins.name);
+                                                    if self.edit_insert_slot == Some((track.id.clone(), ins_idx)) {
+                                                        self.edit_insert_slot = None;
+                                                    }
+                                                }
+                                                let is_effect_active = self.edit_insert_slot == Some((track.id.clone(), ins_idx));
+                                                let edit_btn = if is_effect_active {
+                                                    egui::Button::new("🎛").fill(egui::Color32::from_rgb(50, 90, 150))
+                                                } else {
+                                                    egui::Button::new("🎛")
+                                                };
+                                                if ui.add(edit_btn).on_hover_text("Open Effect Controls in slide-out panel").clicked() {
+                                                    if is_effect_active {
+                                                        self.edit_insert_slot = None;
+                                                    } else {
+                                                        self.edit_insert_slot = Some((track.id.clone(), ins_idx));
+                                                    }
+                                                }
+                                            });
+                                        });
+                                    });
+                                }
+                            }
                         }
-                    });
+                    },
+                );
 
                 if !is_open {
                     self.edit_track_id = None;
+                    self.edit_insert_slot = None;
+                } else if let Some(parent_rect) = inst_rect {
+                    // Child sliding panel stack docked directly to parent instrument panel
+                    if let Some((ref tr_id, ins_idx)) = self.edit_insert_slot.clone() {
+                        if tr_id == &track.id {
+                            if let Some(ins) = track.inserts.get(ins_idx).cloned() {
+                                let mut is_effect_open = true;
+                                let mut effect_stack = SlidingPanelStack::from_parent(parent_rect);
+
+                                let _effect_rect = effect_stack.panel(
+                                    ctx,
+                                    egui::Id::new("effect_inspector_window"),
+                                    format!("⚡ Effect: {} (Track: {})", ins.name, track.name),
+                                    &mut is_effect_open,
+                                    |ui| {
+                                        ui.label(format!("Plugin: {}", ins.name));
+                                        ui.small(format!("URI: {}", ins.uri));
+                                        ui.separator();
+
+                                        if ins.params.is_empty() {
+                                            ui.label("No exposed control parameters for this plugin.");
+                                        } else {
+                                            ui.label(format!("Parameters ({})", ins.params.len()));
+                                            ui.add_space(4.0);
+
+                                            egui::ScrollArea::vertical()
+                                                .max_height(350.0)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    for p in &ins.params {
+                                                        let mut val = p.value;
+                                                        ui.horizontal(|ui| {
+                                                            ui.set_min_width(120.0);
+                                                            ui.label(&p.name);
+                                                            if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
+                                                                self.send_cmd(IpcCommand::SetTrackParam {
+                                                                    track_id: tr_id.clone(),
+                                                                    param_name: p.name.clone(),
+                                                                    value: val,
+                                                                });
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                        }
+                                    },
+                                );
+
+                                if !is_effect_open {
+                                    self.edit_insert_slot = None;
+                                }
+                            } else {
+                                self.edit_insert_slot = None;
+                            }
+                        } else {
+                            self.edit_insert_slot = None;
+                        }
+                    }
                 }
             } else {
                 self.edit_track_id = None;
+                self.edit_insert_slot = None;
             }
+        } else {
+            self.edit_insert_slot = None;
         }
     }
 }
@@ -754,16 +950,16 @@ impl JamOutApp {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.set_min_height(48.0);
-                        // Strict fixed-width Track Header (180px) so lanes never get offset by label length
-                        ui.allocate_ui(egui::vec2(180.0, 42.0), |ui| {
-                            ui.set_width(180.0);
-                            ui.set_max_width(180.0);
+                        // Strict fixed-width Track Header (220px) so lanes never get offset by label length
+                        ui.allocate_ui(egui::vec2(220.0, 42.0), |ui| {
+                            ui.set_width(220.0);
+                            ui.set_max_width(220.0);
                             ui.vertical(|ui| {
                                 let (need_rename, new_name_str) = {
                                     let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
                                     let resp = ui.add(
                                         egui::TextEdit::singleline(current_buf)
-                                            .desired_width(170.0)
+                                            .desired_width(210.0)
                                             .hint_text("Track Name")
                                     );
                                     if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
@@ -781,12 +977,25 @@ impl JamOutApp {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.small(&format!("ID: {}", track.id));
-                                    if ui.small_button("🎹").clicked() {
+                                    if ui.small_button("🎹").on_hover_text("Open Piano Roll").clicked() {
                                         self.selected_track_id = track.id.clone();
                                         self.active_tab = Tab::PianoRoll;
                                     }
-                                    if ui.small_button("🎛").clicked() {
+                                    if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP Parameters").clicked() {
+                                        if self.edit_track_id.as_deref() != Some(&track.id) {
+                                            self.edit_insert_slot = None;
+                                        }
                                         self.edit_track_id = Some(track.id.clone());
+                                    }
+                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
+                                    }
+                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
+                                    }
+                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                        self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
+                                        self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
                                 });
                             });
@@ -1050,21 +1259,21 @@ impl JamOutApp {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for track in &tracks {
+            for (idx, track) in tracks.iter().enumerate() {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.set_min_height(48.0);
 
-                        // Track Header (Fixed 180px width to match timeline)
-                        ui.allocate_ui(egui::vec2(180.0, 44.0), |ui| {
-                            ui.set_width(180.0);
-                            ui.set_max_width(180.0);
+                        // Track Header (Fixed 220px width to match timeline)
+                        ui.allocate_ui(egui::vec2(220.0, 44.0), |ui| {
+                            ui.set_width(220.0);
+                            ui.set_max_width(220.0);
                             ui.vertical(|ui| {
                                 let (need_rename, new_name_str) = {
                                     let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
                                     let resp = ui.add(
                                         egui::TextEdit::singleline(current_buf)
-                                            .desired_width(170.0)
+                                            .desired_width(210.0)
                                             .hint_text("Track Name")
                                     );
                                     if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
@@ -1083,10 +1292,20 @@ impl JamOutApp {
                                 ui.horizontal(|ui| {
                                     ui.small(&format!("ID: {}", track.id));
                                     if ui.small_button("🎛").on_hover_text("Open DSP / Synth Parameter Controls").clicked() {
+                                        if self.edit_track_id.as_deref() != Some(&track.id) {
+                                            self.edit_insert_slot = None;
+                                        }
                                         self.edit_track_id = Some(track.id.clone());
                                     }
-                                    if let Some(ref plug) = track.current_plugin {
-                                        ui.small(plug);
+                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
+                                    }
+                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
+                                    }
+                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                        self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
+                                        self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
                                 });
                             });
