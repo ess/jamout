@@ -57,6 +57,7 @@ struct JamOutApp {
     // Live plugin / synth editor modal
     pub edit_track_id: Option<String>,
     pub preset_save_name: String,
+    pub param_search_filter: String,
 
     // Note duration and drag drawing state
     pub note_duration_ticks: u64,
@@ -228,6 +229,7 @@ impl JamOutApp {
             track_name_edits: HashMap::new(),
             edit_track_id: None,
             preset_save_name: "custom_patch.json".to_string(),
+            param_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
             drag_start: None,
         }
@@ -475,13 +477,6 @@ impl eframe::App for JamOutApp {
                                 });
                                 self.status_msg = format!("Renamed track to '{}'", new_name_str);
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Pop Out GUI ↗").clicked() {
-                                    self.send_cmd(IpcCommand::OpenPluginGui {
-                                        track_id: track.id.clone(),
-                                    });
-                                }
-                            });
                         });
                         ui.small(format!("Track ID: {} | Live DSP Control", track.id));
                         ui.separator();
@@ -557,34 +552,64 @@ impl eframe::App for JamOutApp {
                         if track.params.is_empty() {
                             ui.label("No tweakable DSP parameters exposed for this track (e.g. raw audio clip).");
                         } else {
-                            ui.label("Live Parameters:");
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Live Parameters ({})", track.params.len()));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if !self.param_search_filter.is_empty() && ui.small_button("Clear").clicked() {
+                                        self.param_search_filter.clear();
+                                    }
+                                    ui.add(egui::TextEdit::singleline(&mut self.param_search_filter).hint_text("🔍 Search parameters..."));
+                                });
+                            });
                             ui.add_space(4.0);
 
-                            for param in &track.params {
-                                let mut val = param.value;
-                                ui.horizontal(|ui| {
-                                    let label = match param.name.as_str() {
-                                        "cutoff" => "Cutoff (Hz)",
-                                        "resonance" => "Resonance",
-                                        "glide_ms" => "Glide (ms)",
-                                        "drive" => "Drive / Sat",
-                                        "attack_ms" => "Attack (ms)",
-                                        "decay_ms" => "Decay (ms)",
-                                        "sustain" => "Sustain",
-                                        "release_ms" => "Release (ms)",
-                                        other => other,
-                                    };
-                                    ui.set_min_width(90.0);
-                                    ui.label(label);
-                                    if ui.add(egui::Slider::new(&mut val, param.min..=param.max)).changed() {
-                                        self.send_cmd(IpcCommand::SetTrackParam {
-                                            track_id: track.id.clone(),
-                                            param_name: param.name.clone(),
-                                            value: val,
-                                        });
+                            let filter_lower = self.param_search_filter.trim().to_lowercase();
+                            let filtered_params: Vec<_> = track
+                                .params
+                                .iter()
+                                .filter(|p| {
+                                    if filter_lower.is_empty() {
+                                        true
+                                    } else {
+                                        p.name.to_lowercase().contains(&filter_lower)
+                                    }
+                                })
+                                .collect();
+
+                            egui::ScrollArea::vertical()
+                                .max_height(250.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if filtered_params.is_empty() {
+                                        ui.label("No parameters match the search filter.");
+                                    } else {
+                                        for param in filtered_params {
+                                            let mut val = param.value;
+                                            ui.horizontal(|ui| {
+                                                let label = match param.name.as_str() {
+                                                    "cutoff" => "Cutoff (Hz)",
+                                                    "resonance" => "Resonance",
+                                                    "glide_ms" => "Glide (ms)",
+                                                    "drive" => "Drive / Sat",
+                                                    "attack_ms" => "Attack (ms)",
+                                                    "decay_ms" => "Decay (ms)",
+                                                    "sustain" => "Sustain",
+                                                    "release_ms" => "Release (ms)",
+                                                    other => other,
+                                                };
+                                                ui.set_min_width(120.0);
+                                                ui.label(label);
+                                                if ui.add(egui::Slider::new(&mut val, param.min..=param.max)).changed() {
+                                                    self.send_cmd(IpcCommand::SetTrackParam {
+                                                        track_id: track.id.clone(),
+                                                        param_name: param.name.clone(),
+                                                        value: val,
+                                                    });
+                                                }
+                                            });
+                                        }
                                     }
                                 });
-                            }
 
                             ui.add_space(8.0);
                             ui.separator();
@@ -761,9 +786,6 @@ impl JamOutApp {
                                     }
                                     if ui.small_button("🎛").clicked() {
                                         self.edit_track_id = Some(track.id.clone());
-                                        self.send_cmd(IpcCommand::OpenPluginGui {
-                                            track_id: track.id.clone(),
-                                        });
                                     }
                                 });
                             });
@@ -1023,9 +1045,6 @@ impl JamOutApp {
                         ui.add_space(6.0);
                         if ui.button("🎛 Edit").clicked() {
                             self.edit_track_id = Some(track.id.clone());
-                            self.send_cmd(IpcCommand::OpenPluginGui {
-                                track_id: track.id.clone(),
-                            });
                         }
                     });
                 });
