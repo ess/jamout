@@ -1,7 +1,9 @@
+mod search_input;
 mod sliding_panel;
 
 use eframe::egui;
 use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse};
+use search_input::{SearchInput, SearchablePicker};
 use sliding_panel::SlidingPanelStack;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -50,6 +52,14 @@ struct JamOutApp {
     pub project_path_input: String,
     pub new_project_title: String,
     pub new_project_bpm: f64,
+
+    // Song section management UI state
+    pub show_section_dialog: bool,
+    pub new_section_name: String,
+    pub new_section_start_tick: u64,
+    pub new_section_length_ticks: u64,
+    pub new_section_energy: u8,
+
     // Piano roll state
     pub selected_track_id: String,
     pub piano_roll_note_pitch: u8,
@@ -62,6 +72,8 @@ struct JamOutApp {
     pub edit_insert_slot: Option<(String, usize)>, // (track_id, insert_index)
     pub preset_save_name: String,
     pub param_search_filter: String,
+    pub plugin_search_filter: String,
+    pub insert_search_filter: String,
 
     // Note duration and drag drawing state
     pub note_duration_ticks: u64,
@@ -277,9 +289,14 @@ impl JamOutApp {
             drag_bias_ticks: 15,   // +15 ticks lazy 90s R&B drag
             freehand_drift: false,
             show_project_dialog: false,
-            project_path_input: "doc/songs/the_white_flame.json".to_string(),
+            project_path_input: String::new(),
             new_project_title: "My New Jam".to_string(),
             new_project_bpm: 68.0,
+            show_section_dialog: false,
+            new_section_name: "Verse 1".to_string(),
+            new_section_start_tick: 0,
+            new_section_length_ticks: 3840, // 1 bar (4 beats) default
+            new_section_energy: 5,
             selected_track_id: "bass".to_string(),
             piano_roll_note_pitch: 50, // D3 default
             track_name_edits: HashMap::new(),
@@ -287,6 +304,8 @@ impl JamOutApp {
             edit_insert_slot: None,
             preset_save_name: "custom_patch.json".to_string(),
             param_search_filter: String::new(),
+            plugin_search_filter: String::new(),
+            insert_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
             drag_start: None,
         }
@@ -496,6 +515,117 @@ impl eframe::App for JamOutApp {
                 });
         }
 
+        // Song Section Manager Modal Dialog
+        if self.show_section_dialog {
+            egui::Window::new("🎼 Section Manager")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.heading("Add Song Section");
+                    ui.small("Sections define song structure with tick precision (960 PPQ).");
+                    ui.add_space(8.0);
+
+                    ui.label("Presets:");
+                    ui.horizontal_wrapped(|ui| {
+                        let presets = [
+                            ("Intro (4 bars)", "Intro", 15360),
+                            ("Verse 1 (4 bars)", "Verse 1", 15360),
+                            ("Chorus 1 (4 bars)", "Chorus 1", 15360),
+                            ("Bridge (4 bars)", "Bridge", 15360),
+                            ("Outro (4 bars)", "Outro", 15360),
+                            ("Pickup (2 beats)", "Pickup", 1920),
+                            ("Break (1 bar)", "Break", 3840),
+                        ];
+                        for (label, name, len) in presets {
+                            if ui.button(label).clicked() {
+                                self.new_section_name = name.to_string();
+                                self.new_section_length_ticks = len;
+                            }
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut self.new_section_name);
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Start Tick:");
+                        ui.add(egui::DragValue::new(&mut self.new_section_start_tick).speed(240));
+
+                        let cur_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
+                        if ui.button("📍 At Playhead").clicked() {
+                            self.new_section_start_tick = cur_tick;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Length Ticks:");
+                        ui.add(egui::DragValue::new(&mut self.new_section_length_ticks).speed(240).range(240..=1000000));
+                    });
+
+                    // Human-readable timing readout
+                    let tpb = 3840u64; // 4/4 ticks per bar
+                    let start_bar = (self.new_section_start_tick / tpb) + 1;
+                    let start_beat = ((self.new_section_start_tick % tpb) as f64 / 960.0) + 1.0;
+                    let bars_f = self.new_section_length_ticks as f64 / 3840.0;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Starts: Bar {}, Beat {:.2}  |  Length: {:.2} bars ({:.1} beats)",
+                            start_bar, start_beat, bars_f, bars_f * 4.0
+                        )).italics().color(egui::Color32::from_rgb(180, 200, 240))
+                    );
+
+                    ui.horizontal(|ui| {
+                        ui.label("Snap / Normalize:");
+                        if ui.button("🎯 Snap to Beat").on_hover_text("Normalize start and length to nearest quarter note (960 ticks)").clicked() {
+                            self.new_section_start_tick = (self.new_section_start_tick as f64 / 960.0).round() as u64 * 960;
+                            self.new_section_length_ticks = (self.new_section_length_ticks as f64 / 960.0).round().max(1.0) as u64 * 960;
+                        }
+                        if ui.button("🎯 Snap to Bar").on_hover_text("Normalize start and length to nearest 4/4 bar (3840 ticks)").clicked() {
+                            self.new_section_start_tick = (self.new_section_start_tick as f64 / 3840.0).round() as u64 * 3840;
+                            self.new_section_length_ticks = (self.new_section_length_ticks as f64 / 3840.0).round().max(1.0) as u64 * 3840;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Arrangement Energy (1-10):");
+                        ui.add(egui::Slider::new(&mut self.new_section_energy, 1..=10));
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("➕ Add Section").clicked() {
+                            let name = self.new_section_name.trim();
+                            if !name.is_empty() {
+                                let id = name.to_lowercase().replace(' ', "_");
+                                self.send_cmd(IpcCommand::AddSection {
+                                    id: id.clone(),
+                                    name: name.to_string(),
+                                    start_tick: self.new_section_start_tick,
+                                    length_ticks: self.new_section_length_ticks,
+                                    energy: self.new_section_energy,
+                                });
+                                self.status_msg = format!("Added section '{}'", name);
+                                self.new_section_start_tick += self.new_section_length_ticks;
+                                self.show_section_dialog = false;
+                            }
+                        }
+
+                        if ui.button("Close").clicked() {
+                            self.show_section_dialog = false;
+                        }
+                    });
+                });
+        }
+
         // Central Workspace Area
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.active_tab {
@@ -551,36 +681,27 @@ impl eframe::App for JamOutApp {
                             ui.label("Active Instrument:");
                             let current_plug = track.current_plugin.as_deref().unwrap_or("None");
 
-                            egui::ComboBox::from_id_salt(format!("plugin_sel_{}", track.id))
-                                .selected_text(current_plug)
-                                .show_ui(ui, |ui| {
-                                    let available = self.last_status.as_ref()
-                                        .map(|s| s.available_plugins.clone())
-                                        .unwrap_or_default();
+                            let available = self.last_status.as_ref()
+                                .map(|s| s.available_plugins.clone())
+                                .unwrap_or_default();
 
-                                    if !available.is_empty() {
-                                        ui.label("--- Available Plugins (CLAP / LV2) ---");
-                                        for plug in &available {
-                                            let display = format!("{} ({})", plug.name, plug.plugin_format);
-                                            let is_selected = current_plug == display;
-                                            if ui.selectable_label(is_selected, &display).clicked() {
-                                                self.send_cmd(IpcCommand::SwitchTrackPlugin {
-                                                    track_id: track.id.clone(),
-                                                    plugin_uri_or_type: plug.uri_or_path.clone(),
-                                                    plugin_name: display,
-                                                });
-                                            }
-                                        }
-                                    } else {
-                                        ui.label("(No system LV2/CLAP plugins found)");
-                                    }
+                            let chosen_plug = SearchablePicker::show(
+                                ui,
+                                format!("plugin_sel_{}", track.id),
+                                current_plug,
+                                &mut self.plugin_search_filter,
+                                &available,
+                                |plug| format!("{} ({})", plug.name, plug.plugin_format),
+                            );
 
-                                    ui.separator();
-                                    if ui.button("🔄 Rescan Plugins").clicked() {
-                                        self.send_cmd(IpcCommand::RescanPlugins);
-                                        self.status_msg = "Rescanning system LV2 and CLAP plugins...".to_string();
-                                    }
+                            if let Some(plug) = chosen_plug {
+                                let display = format!("{} ({})", plug.name, plug.plugin_format);
+                                self.send_cmd(IpcCommand::SwitchTrackPlugin {
+                                    track_id: track.id.clone(),
+                                    plugin_uri_or_type: plug.uri_or_path.clone(),
+                                    plugin_name: display,
                                 });
+                            }
 
                             if ui.button("🔄").on_hover_text("Rescan system for newly installed LV2 and CLAP plugins").clicked() {
                                 self.send_cmd(IpcCommand::RescanPlugins);
@@ -595,10 +716,11 @@ impl eframe::App for JamOutApp {
                             ui.horizontal(|ui| {
                                 ui.label(format!("Live Parameters ({})", track.params.len()));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if !self.param_search_filter.is_empty() && ui.small_button("Clear").clicked() {
-                                        self.param_search_filter.clear();
-                                    }
-                                    ui.add(egui::TextEdit::singleline(&mut self.param_search_filter).hint_text("🔍 Search parameters..."));
+                                    ui.add(
+                                        SearchInput::new(&mut self.param_search_filter, "🔍 Search parameters...")
+                                            .id_salt("param_search_input")
+                                            .desired_width(180.0)
+                                    );
                                 });
                             });
                             ui.add_space(4.0);
@@ -708,29 +830,28 @@ impl eframe::App for JamOutApp {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("⚡ Insert Effects Chain").strong());
 
-                                egui::ComboBox::from_id_salt(format!("add_insert_sel_{}", track.id))
-                                    .selected_text("➕ Add Effect...")
-                                    .show_ui(ui, |ui| {
-                                        let available = self.last_status.as_ref()
-                                            .map(|s| s.available_plugins.clone())
-                                            .unwrap_or_default();
+                                let available = self.last_status.as_ref()
+                                    .map(|s| s.available_plugins.clone())
+                                    .unwrap_or_default();
 
-                                        if !available.is_empty() {
-                                            for plug in &available {
-                                                let display = format!("{} ({})", plug.name, plug.plugin_format);
-                                                if ui.button(&display).clicked() {
-                                                    self.send_cmd(IpcCommand::AddTrackInsert {
-                                                        track_id: track.id.clone(),
-                                                        plugin_uri_or_path: plug.uri_or_path.clone(),
-                                                        plugin_name: display.clone(),
-                                                    });
-                                                    self.status_msg = format!("Added insert effect '{}'", display);
-                                                }
-                                            }
-                                        } else {
-                                            ui.label("(No system plugins available)");
-                                        }
+                                let chosen_effect = SearchablePicker::show(
+                                    ui,
+                                    format!("add_insert_sel_{}", track.id),
+                                    "➕ Add Effect...",
+                                    &mut self.insert_search_filter,
+                                    &available,
+                                    |plug| format!("{} ({})", plug.name, plug.plugin_format),
+                                );
+
+                                if let Some(plug) = chosen_effect {
+                                    let display = format!("{} ({})", plug.name, plug.plugin_format);
+                                    self.send_cmd(IpcCommand::AddTrackInsert {
+                                        track_id: track.id.clone(),
+                                        plugin_uri_or_path: plug.uri_or_path.clone(),
+                                        plugin_name: display.clone(),
                                     });
+                                    self.status_msg = format!("Added insert effect '{}'", display);
+                                }
                             });
 
                             if track.inserts.is_empty() {
@@ -871,11 +992,31 @@ impl JamOutApp {
         ui.add_space(6.0);
 
         // --- SECTION MARKER LANE ---
-        ui.label(egui::RichText::new("Song Sections (Orchestration Scope):").small());
         ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Song Sections (Orchestration Scope):").small());
+            if ui.button("➕ Add Section").on_hover_text("Define or append a song section with tick precision").clicked() {
+                if let Some(last_sec) = sections.last() {
+                    self.new_section_start_tick = last_sec.end_tick();
+                } else {
+                    self.new_section_start_tick = current_tick;
+                }
+                self.show_section_dialog = true;
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if sections.is_empty() {
+                ui.small("(No sections defined. Click '➕ Add Section' to create verse, chorus, or pickup sections.)");
+            }
             for sec in &sections {
                 let is_current = active_section_id.as_deref() == Some(&sec.id);
-                let btn_text = format!("{} (Bar {}-{})", sec.name, sec.start_bar, sec.start_bar + sec.bars - 1);
+                let timing_str = if sec.length_ticks % 3840 == 0 && sec.start_tick % 3840 == 0 {
+                    format!("Bar {}-{}", sec.start_bar, sec.start_bar + sec.bars.max(1) - 1)
+                } else {
+                    let (b, beat) = sec.start_bar_beat();
+                    format!("Bar {}.{}, {}t", b, beat, sec.length_ticks)
+                };
+                let btn_text = format!("{} ({})", sec.name, timing_str);
                 let btn = if is_current {
                     egui::Button::new(egui::RichText::new(btn_text).strong().color(egui::Color32::BLACK))
                         .fill(egui::Color32::from_rgb(255, 215, 80))
@@ -888,6 +1029,13 @@ impl JamOutApp {
                     // Click section to jump playhead to its downbeat
                     self.send_cmd(IpcCommand::Seek { tick: sec.start_tick() });
                 }
+
+                if ui.small_button("🗑").on_hover_text(format!("Delete section '{}'", sec.name)).clicked() {
+                    self.send_cmd(IpcCommand::RemoveSection { section_id: sec.id.clone() });
+                    self.status_msg = format!("Removed section '{}'", sec.name);
+                }
+
+                ui.add_space(4.0);
             }
         });
 
