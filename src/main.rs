@@ -325,10 +325,17 @@ impl eframe::App for JamOutApp {
 
                 ui.separator();
 
-                // Tempo and Time display
+                // Tempo, Time Signature, and Bar/Beat display
                 let current_bar = (current_tick / (4 * 960)) + 1;
                 let current_beat = ((current_tick % (4 * 960)) / 960) + 1;
-                ui.monospace(format!("Bar {:02} : {:02} | {:.1} BPM", current_bar, current_beat, bpm));
+                let active_meter = self.last_status.as_ref()
+                    .and_then(|s| {
+                        let cur_id = s.active_section_id.as_deref();
+                        s.sections.iter().find(|sec| cur_id == Some(&sec.id))
+                            .map(|sec| format!("{}/{}", sec.time_signature.numerator, sec.time_signature.denominator))
+                    })
+                    .unwrap_or_else(|| "4/4".to_string());
+                ui.monospace(format!("Bar {:02} : {:02} | {} | {:.1} BPM", current_bar, current_beat, active_meter, bpm));
 
                 ui.separator();
 
@@ -781,12 +788,22 @@ impl JamOutApp {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.small(&format!("ID: {}", track.id));
-                                    if ui.small_button("🎹").clicked() {
+                                    if ui.small_button("🎹").on_hover_text("Open Piano Roll").clicked() {
                                         self.selected_track_id = track.id.clone();
                                         self.active_tab = Tab::PianoRoll;
                                     }
-                                    if ui.small_button("🎛").clicked() {
+                                    if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP").clicked() {
                                         self.edit_track_id = Some(track.id.clone());
+                                    }
+                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
+                                    }
+                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
+                                    }
+                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                        self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
+                                        self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
                                 });
                             });
@@ -1050,7 +1067,7 @@ impl JamOutApp {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for track in &tracks {
+            for (idx, track) in tracks.iter().enumerate() {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.set_min_height(48.0);
@@ -1085,8 +1102,15 @@ impl JamOutApp {
                                     if ui.small_button("🎛").on_hover_text("Open DSP / Synth Parameter Controls").clicked() {
                                         self.edit_track_id = Some(track.id.clone());
                                     }
-                                    if let Some(ref plug) = track.current_plugin {
-                                        ui.small(plug);
+                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
+                                    }
+                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
+                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
+                                    }
+                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                        self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
+                                        self.status_msg = format!("Deleted track '{}'", track.name);
                                     }
                                 });
                             });
