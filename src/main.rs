@@ -1,5 +1,8 @@
+mod sliding_panel;
+
 use eframe::egui;
 use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse};
+use sliding_panel::SlidingPanelStack;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -511,17 +514,13 @@ impl eframe::App for JamOutApp {
 
             if let Some(track) = track_opt {
                 let mut is_open = true;
-                let mut instrument_right_x = 12.0 + 350.0 + 8.0;
-                let mut instrument_top_y = 44.0;
-                let inst_window_resp = egui::Window::new(format!("🎛 Tweak Instrument: {}", track.name))
-                    .id(egui::Id::new("instrument_inspector_window"))
-                    .open(&mut is_open)
-                    .resizable(true)
-                    .movable(false)
-                    .collapsible(false)
-                    .default_width(340.0)
-                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 44.0))
-                    .show(ctx, |ui| {
+                let mut root_stack = SlidingPanelStack::docked_left(44.0);
+                let inst_rect = root_stack.panel(
+                    ctx,
+                    egui::Id::new("instrument_inspector_window"),
+                    format!("🎛 Tweak Instrument: {}", track.name),
+                    &mut is_open,
+                    |ui| {
                         ui.horizontal(|ui| {
                             let (need_rename, new_name_str) = {
                                 let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
@@ -771,70 +770,68 @@ impl eframe::App for JamOutApp {
                                 }
                             }
                         }
-                    });
-
-                if let Some(ref resp) = inst_window_resp {
-                    instrument_right_x = resp.response.rect.right() + 8.0;
-                    instrument_top_y = resp.response.rect.top();
-                }
+                    },
+                );
 
                 if !is_open {
                     self.edit_track_id = None;
                     self.edit_insert_slot = None;
-                } else if let Some((ref tr_id, ins_idx)) = self.edit_insert_slot.clone() {
-                    // Slide-out child effect panel directly to the right of the instrument panel
-                    if tr_id == &track.id {
-                        if let Some(ins) = track.inserts.get(ins_idx).cloned() {
-                            let mut is_effect_open = true;
-                            egui::Window::new(format!("⚡ Effect: {} (Track: {})", ins.name, track.name))
-                                .id(egui::Id::new("effect_inspector_window"))
-                                .open(&mut is_effect_open)
-                                .resizable(true)
-                                .movable(false)
-                                .collapsible(false)
-                                .default_width(340.0)
-                                .anchor(egui::Align2::LEFT_TOP, egui::vec2(instrument_right_x, instrument_top_y))
-                                .show(ctx, |ui| {
-                                    ui.label(format!("Plugin: {}", ins.name));
-                                    ui.small(format!("URI: {}", ins.uri));
-                                    ui.separator();
+                } else if let Some(parent_rect) = inst_rect {
+                    // Child sliding panel stack docked directly to parent instrument panel
+                    if let Some((ref tr_id, ins_idx)) = self.edit_insert_slot.clone() {
+                        if tr_id == &track.id {
+                            if let Some(ins) = track.inserts.get(ins_idx).cloned() {
+                                let mut is_effect_open = true;
+                                let mut effect_stack = SlidingPanelStack::from_parent(parent_rect);
 
-                                    if ins.params.is_empty() {
-                                        ui.label("No exposed control parameters for this plugin.");
-                                    } else {
-                                        ui.label(format!("Parameters ({})", ins.params.len()));
-                                        ui.add_space(4.0);
+                                let _effect_rect = effect_stack.panel(
+                                    ctx,
+                                    egui::Id::new("effect_inspector_window"),
+                                    format!("⚡ Effect: {} (Track: {})", ins.name, track.name),
+                                    &mut is_effect_open,
+                                    |ui| {
+                                        ui.label(format!("Plugin: {}", ins.name));
+                                        ui.small(format!("URI: {}", ins.uri));
+                                        ui.separator();
 
-                                        egui::ScrollArea::vertical()
-                                            .max_height(350.0)
-                                            .auto_shrink([false, false])
-                                            .show(ui, |ui| {
-                                                for p in &ins.params {
-                                                    let mut val = p.value;
-                                                    ui.horizontal(|ui| {
-                                                        ui.set_min_width(120.0);
-                                                        ui.label(&p.name);
-                                                        if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
-                                                            self.send_cmd(IpcCommand::SetTrackParam {
-                                                                track_id: tr_id.clone(),
-                                                                param_name: p.name.clone(),
-                                                                value: val,
-                                                            });
-                                                        }
-                                                    });
-                                                }
-                                            });
-                                    }
-                                });
+                                        if ins.params.is_empty() {
+                                            ui.label("No exposed control parameters for this plugin.");
+                                        } else {
+                                            ui.label(format!("Parameters ({})", ins.params.len()));
+                                            ui.add_space(4.0);
 
-                            if !is_effect_open {
+                                            egui::ScrollArea::vertical()
+                                                .max_height(350.0)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    for p in &ins.params {
+                                                        let mut val = p.value;
+                                                        ui.horizontal(|ui| {
+                                                            ui.set_min_width(120.0);
+                                                            ui.label(&p.name);
+                                                            if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
+                                                                self.send_cmd(IpcCommand::SetTrackParam {
+                                                                    track_id: tr_id.clone(),
+                                                                    param_name: p.name.clone(),
+                                                                    value: val,
+                                                                });
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                        }
+                                    },
+                                );
+
+                                if !is_effect_open {
+                                    self.edit_insert_slot = None;
+                                }
+                            } else {
                                 self.edit_insert_slot = None;
                             }
                         } else {
                             self.edit_insert_slot = None;
                         }
-                    } else {
-                        self.edit_insert_slot = None;
                     }
                 }
             } else {
