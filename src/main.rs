@@ -2877,6 +2877,8 @@ impl JamOutApp {
         ui.horizontal(|ui| {
             ui.label("Length:");
             let durations = [
+                (60u64, "1/64"),
+                (120u64, "1/32"),
                 (240u64, "1/16"),
                 (480u64, "1/8"),
                 (960u64, "1/4"),
@@ -3094,7 +3096,7 @@ impl JamOutApp {
                                                 }
                                         });
                                         let note_off_tick = note_off.map(|off| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                        let duration = note_off_tick.saturating_sub(ev.tick).max(60);
+                                        let duration = note_off_tick.saturating_sub(ev.tick).max(10);
                                         let min_ticks = ((6.0 / grid_rect.width().max(1.0)) * total_ticks as f32) as u64;
                                         let end_tick = (ev.tick + duration).max(ev.tick + min_ticks);
                                         let tolerance = 40u64;
@@ -3210,17 +3212,19 @@ impl JamOutApp {
                             } else {
                                 block.base_length_ticks.saturating_sub(start_tick)
                             };
+                            let shift_held = ui.input(|i| i.modifiers.shift);
+                            let is_unquantized = shift_held || self.freehand_drift;
+                            let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
                             let final_duration = if let Some(pos) = grid_resp.interact_pointer_pos() {
                                 let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                                 let current_tick = (pct_x * total_ticks as f32) as u64;
                                 if current_tick > start_tick {
-                                    let shift_held = ui.input(|i| i.modifiers.shift);
-                                    let drag_len = if shift_held || self.freehand_drift {
-                                        current_tick - start_tick
+                                    let drag_len = if is_unquantized {
+                                        (current_tick - start_tick).max(min_len)
                                     } else {
-                                        ((current_tick - start_tick + 120) / 240) * 240
+                                        (((current_tick - start_tick + 120) / 240) * 240).max(min_len)
                                     };
-                                    drag_len.max(self.note_duration_ticks).min(max_len)
+                                    drag_len.min(max_len)
                                 } else {
                                     self.note_duration_ticks.min(max_len)
                                 }
@@ -3301,7 +3305,7 @@ impl JamOutApp {
                                             }
                                     });
                                     let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                    let duration = note_off_tick.saturating_sub(ev.tick).max(60);
+                                    let duration = note_off_tick.saturating_sub(ev.tick).max(10);
                                     let min_ticks = ((6.0 / grid_rect.width().max(1.0)) * total_ticks as f32) as u64;
                                     let end_tick = (ev.tick + duration).max(ev.tick + min_ticks);
 
@@ -3420,7 +3424,7 @@ impl JamOutApp {
                                 .map(|off_ev| off_ev.tick)
                                 .unwrap_or(ev.tick + self.note_duration_ticks);
 
-                            let duration = note_off_tick.saturating_sub(ev.tick).max(60);
+                            let duration = note_off_tick.saturating_sub(ev.tick).max(10);
 
                             let row = (max_note - note) as f32;
                             let y = grid_rect.top() + row * row_height;
@@ -3477,7 +3481,16 @@ impl JamOutApp {
                         } else {
                             u64::MAX
                         };
-                        let preview_len = cur_tick.saturating_sub(start_tick).max(self.note_duration_ticks).min(max_len);
+                        let shift_held = ui.input(|i| i.modifiers.shift);
+                        let is_unquantized = shift_held || self.freehand_drift;
+                        let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
+                        let raw_len = cur_tick.saturating_sub(start_tick);
+                        let drag_len = if is_unquantized {
+                            raw_len.max(min_len)
+                        } else {
+                            (((raw_len + 120) / 240) * 240).max(min_len)
+                        };
+                        let preview_len = drag_len.min(max_len);
                         if pitch >= min_note && pitch <= max_note {
                             let row = (max_note - pitch) as f32;
                             let y = grid_rect.top() + row * row_height;
