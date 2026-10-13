@@ -92,6 +92,7 @@ struct JamOutApp {
     pub selected_track_id: String,
     pub piano_roll_note_pitch: u8,
     pub piano_roll_scroll_y: Option<f32>,
+    pub piano_roll_zoom_x: f32,
 
     // Track editing state
     pub track_name_edits: HashMap<String, String>,
@@ -358,6 +359,7 @@ impl JamOutApp {
             selected_track_id: "bass".to_string(),
             piano_roll_note_pitch: 50, // D3 default
             piano_roll_scroll_y: Some(472.0), // Center on Middle C (C4) initially
+            piano_roll_zoom_x: 1.0,
             track_name_edits: HashMap::new(),
             edit_track_id: None,
             edit_insert_slot: None,
@@ -2920,9 +2922,38 @@ impl JamOutApp {
                     self.piano_roll_scroll_y = Some(((max_note - 60) as f32 * row_height - 180.0).max(0.0));
                 }
             }
+
+            ui.separator();
+            ui.label("Zoom:");
+            if ui.small_button("➖").on_hover_text("Zoom out (Ctrl + Wheel Down)").clicked() {
+                self.piano_roll_zoom_x = (self.piano_roll_zoom_x / 1.25).max(0.25);
+            }
+            let zoom_pct = (self.piano_roll_zoom_x * 100.0).round() as i32;
+            if ui.small_button(format!("{}%", zoom_pct)).on_hover_text("Click to reset zoom to 100%").clicked() {
+                self.piano_roll_zoom_x = 1.0;
+            }
+            if ui.small_button("➕").on_hover_text("Zoom in (Ctrl + Wheel Up)").clicked() {
+                self.piano_roll_zoom_x = (self.piano_roll_zoom_x * 1.25).min(8.0);
+            }
         });
 
         ui.add_space(4.0);
+
+        let (zoom_delta, ctrl_held) = ui.input(|i| {
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            let factor = if i.zoom_delta() != 1.0 {
+                i.zoom_delta()
+            } else if ctrl && i.raw_scroll_delta.y != 0.0 {
+                if i.raw_scroll_delta.y > 0.0 { 1.15 } else { 1.0 / 1.15 }
+            } else {
+                1.0
+            };
+            (factor, ctrl)
+        });
+
+        if zoom_delta != 1.0 {
+            self.piano_roll_zoom_x = (self.piano_roll_zoom_x * zoom_delta).clamp(0.25, 8.0);
+        }
 
         let tpb = eff_block_ts.ticks_per_bar().max(1);
         let tp_beat = eff_block_ts.ticks_per_beat().max(1);
@@ -2931,14 +2962,16 @@ impl JamOutApp {
         let total_ticks = view_ticks;
         let track_events = block.events.clone();
 
-        let mut scroll = egui::ScrollArea::both();
+        let mut v_scroll = egui::ScrollArea::vertical()
+            .id_salt("piano_roll_v_scroll")
+            .enable_scrolling(!ctrl_held);
         if let Some(offset_y) = self.piano_roll_scroll_y.take() {
-            scroll = scroll.vertical_scroll_offset(offset_y);
+            v_scroll = v_scroll.vertical_scroll_offset(offset_y);
         }
 
-        scroll.show(ui, |ui| {
+        v_scroll.show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Left Keyboard Column (Piano Keys)
+                // Left Keyboard Column (Piano Keys) - Pinned
                 let keyboard_width = 54.0;
                 let (key_rect, key_resp) = ui.allocate_exact_size(
                     egui::vec2(keyboard_width, num_notes as f32 * row_height),
@@ -3003,14 +3036,18 @@ impl JamOutApp {
                     );
                 }
 
-                // Main Note Grid Canvas (with click and drag to draw note lengths!)
-                let grid_width = (ui.available_width() - 20.0).max(650.0);
-                let (grid_rect, grid_resp) = ui.allocate_exact_size(
-                    egui::vec2(grid_width, num_notes as f32 * row_height),
-                    egui::Sense::click_and_drag(),
-                );
+                // Main Note Grid Canvas (wrapped in horizontal ScrollArea for independent horizontal zoom & scrolling)
+                egui::ScrollArea::horizontal()
+                    .id_salt("piano_roll_h_scroll")
+                    .show(ui, |ui| {
+                        let avail_w = (ui.available_width() - 20.0).max(650.0);
+                        let grid_width = (avail_w * self.piano_roll_zoom_x).max(200.0);
+                        let (grid_rect, grid_resp) = ui.allocate_exact_size(
+                            egui::vec2(grid_width, num_notes as f32 * row_height),
+                            egui::Sense::click_and_drag(),
+                        );
 
-                let end_pct = (block.base_length_ticks as f32 / view_ticks as f32).clamp(0.0, 1.0);
+                        let end_pct = (block.base_length_ticks as f32 / view_ticks as f32).clamp(0.0, 1.0);
                 let end_x = grid_rect.left() + end_pct * grid_rect.width();
 
                 let is_resizing_block_now = self.piano_roll_resizing_block.is_some();
@@ -3534,6 +3571,7 @@ impl JamOutApp {
                     let tooltip_text = format!("Block Length: {} ticks ({:.2} bars)", block.base_length_ticks, current_bars);
                     egui::show_tooltip_text(ui.ctx(), ui.layer_id(), egui::Id::new("piano_roll_resize_tip"), tooltip_text);
                 }
+                    });
             });
         });
     }
