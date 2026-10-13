@@ -66,8 +66,6 @@ struct JamOutApp {
     // Song section management UI state
     pub show_section_dialog: bool,
     pub new_section_name: String,
-    pub new_section_start_tick: u64,
-    pub new_section_length_ticks: u64,
     pub new_section_energy: u8,
 
     // Piano roll state
@@ -313,8 +311,6 @@ impl JamOutApp {
             new_project_bpm: 68.0,
             show_section_dialog: false,
             new_section_name: "Verse 1".to_string(),
-            new_section_start_tick: 0,
-            new_section_length_ticks: 3840, // 1 bar (4 beats) default
             new_section_energy: 5,
             selected_track_id: "bass".to_string(),
             piano_roll_note_pitch: 50, // D3 default
@@ -340,6 +336,70 @@ impl JamOutApp {
     fn send_cmd(&self, cmd: IpcCommand) {
         let _ = self.cmd_sender.send(cmd);
     }
+
+    fn prompt_open_project(&mut self) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Open JamBand Project")
+            .add_filter("JamBand Project (*.jam.json, *.json)", &["jam.json", "json"]);
+
+        if let Some(path) = dialog.pick_file() {
+            let path_str = path.to_string_lossy().to_string();
+            self.send_cmd(IpcCommand::LoadProject { path: path_str.clone() });
+            self.project_path_input = path_str.clone();
+            self.status_msg = format!("Loaded project: {}", path_str);
+            self.show_project_dialog = false;
+        }
+    }
+
+    fn prompt_save_project_as(&mut self) {
+        let default_name = self.last_status.as_ref()
+            .map(|s| {
+                let title = s.project_title.trim();
+                if title.is_empty() || title == "Untitled" {
+                    "untitled".to_string()
+                } else {
+                    title.replace(' ', "_").to_lowercase()
+                }
+            })
+            .unwrap_or_else(|| "project".to_string());
+        let default_file = format!("{}.jam.json", default_name);
+
+        let dialog = rfd::FileDialog::new()
+            .set_title("Save JamBand Project As")
+            .set_file_name(&default_file)
+            .add_filter("JamBand Project (*.jam.json)", &["jam.json", "json"]);
+
+        if let Some(path) = dialog.save_file() {
+            let normalized = normalize_jam_path(&path);
+            let path_str = normalized.to_string_lossy().to_string();
+            self.send_cmd(IpcCommand::SaveProject { path: path_str.clone() });
+            self.project_path_input = path_str.clone();
+            self.status_msg = format!("Saved project to: {}", path_str);
+            self.show_project_dialog = false;
+        }
+    }
+
+    fn save_project_quick(&mut self) {
+        let existing = self.last_status.as_ref().and_then(|s| s.project_path.clone());
+        if let Some(path) = existing {
+            self.send_cmd(IpcCommand::SaveProject { path: path.clone() });
+            self.status_msg = format!("Saved project: {}", path);
+        } else {
+            self.prompt_save_project_as();
+        }
+    }
+}
+
+fn normalize_jam_path(path: &std::path::Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if s.ends_with(".jam.json") {
+        path.to_path_buf()
+    } else if s.ends_with(".json") {
+        let stem = s.strip_suffix(".json").unwrap();
+        std::path::PathBuf::from(format!("{}.jam.json", stem))
+    } else {
+        std::path::PathBuf::from(format!("{}.jam.json", s))
+    }
 }
 
 impl eframe::App for JamOutApp {
@@ -351,6 +411,18 @@ impl eframe::App for JamOutApp {
             }
             self.last_status = Some(status);
             self.connected = true;
+        }
+
+        // Global Keyboard Shortcuts for Project Management
+        let ctrl_or_cmd = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        if ctrl_or_cmd {
+            if ctx.input(|i| i.key_pressed(egui::Key::O)) {
+                self.prompt_open_project();
+            } else if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+                self.prompt_save_project_as();
+            } else if ctx.input(|i| !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+                self.save_project_quick();
+            }
         }
 
         // Request continuous repaint for smooth VU meters & playhead
@@ -372,10 +444,16 @@ impl eframe::App for JamOutApp {
 
                 ui.separator();
 
-                // Project Switcher Button & Title
+                // Project Switcher Button & Quick Open / Save Buttons
                 let proj_title = self.last_status.as_ref().map(|s| s.project_title.as_str()).unwrap_or("No Project");
-                if ui.button(format!("📁 Project: {}", proj_title)).clicked() {
+                if ui.button(format!("📁 Project: {}", proj_title)).on_hover_text("Open Project Manager").clicked() {
                     self.show_project_dialog = !self.show_project_dialog;
+                }
+                if ui.small_button("📂").on_hover_text("Open Project File (Ctrl+O)").clicked() {
+                    self.prompt_open_project();
+                }
+                if ui.small_button("💾").on_hover_text("Save Project (Ctrl+S)").clicked() {
+                    self.save_project_quick();
                 }
 
                 ui.separator();
@@ -476,33 +554,43 @@ impl eframe::App for JamOutApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.set_width(450.0);
-                    ui.heading("Open or Save Project");
+                    ui.set_width(460.0);
+                    ui.heading("Project Manager");
                     ui.add_space(8.0);
 
-                    let current_path = self.last_status.as_ref().and_then(|s| s.project_path.clone()).unwrap_or_else(|| "(none)".to_string());
-                    ui.label(format!("Active file: {}", current_path));
-                    ui.add_space(6.0);
+                    let current_path = self.last_status.as_ref()
+                        .and_then(|s| s.project_path.clone())
+                        .unwrap_or_else(|| "(Unsaved In-Memory Project)".to_string());
+                    let current_title = self.last_status.as_ref()
+                        .map(|s| s.project_title.clone())
+                        .unwrap_or_else(|| "Untitled".to_string());
+                    let current_bpm = self.last_status.as_ref()
+                        .map(|s| s.bpm)
+                        .unwrap_or(120.0);
 
-                    ui.label("Project File Path (.json):");
-                    ui.text_edit_singleline(&mut self.project_path_input);
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Active Project:").strong());
+                            ui.label(format!("{} ({:.1} BPM)", current_title, current_bpm));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("File Path:").strong());
+                            ui.monospace(&current_path);
+                        });
+                    });
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("📂 Open / Switch").clicked() {
-                            self.send_cmd(IpcCommand::LoadProject {
-                                path: self.project_path_input.clone(),
-                            });
-                            self.status_msg = format!("Loading project: {}", self.project_path_input);
-                            self.show_project_dialog = false;
+                        if ui.button("📂 Open Project... (Ctrl+O)").clicked() {
+                            self.prompt_open_project();
                         }
 
-                        if ui.button("💾 Save Project").clicked() {
-                            self.send_cmd(IpcCommand::SaveProject {
-                                path: self.project_path_input.clone(),
-                            });
-                            self.status_msg = format!("Saved project to: {}", self.project_path_input);
-                            self.show_project_dialog = false;
+                        if ui.button("💾 Save (Ctrl+S)").clicked() {
+                            self.save_project_quick();
+                        }
+
+                        if ui.button("💾 Save As... (Ctrl+Shift+S)").clicked() {
+                            self.prompt_save_project_as();
                         }
 
                         if ui.button("Close").clicked() {
@@ -510,64 +598,56 @@ impl eframe::App for JamOutApp {
                         }
                     });
 
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
                     ui.separator();
                     ui.heading("✨ Create New Project");
+                    ui.small("Starts a fresh in-memory project. You will be prompted to choose a save file when ready.");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("Title:");
                         ui.text_edit_singleline(&mut self.new_project_title);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Tempo:");
+                        ui.label("Base Tempo:");
                         ui.add(egui::Slider::new(&mut self.new_project_bpm, 40.0..=220.0).text("BPM"));
                     });
                     ui.add_space(6.0);
-                    if ui.button("➕ Create Fresh Project").clicked() {
+                    if ui.button("➕ Create Clean Project").clicked() {
+                        let title = if self.new_project_title.trim().is_empty() {
+                            "Untitled".to_string()
+                        } else {
+                            self.new_project_title.trim().to_string()
+                        };
                         self.send_cmd(IpcCommand::NewProject {
-                            title: self.new_project_title.clone(),
+                            title: title.clone(),
                             bpm: self.new_project_bpm,
                         });
-                        self.status_msg = format!("Created new project: '{}' @ {:.1} BPM", self.new_project_title, self.new_project_bpm);
+                        self.status_msg = format!("Created fresh project: '{}' @ {:.1} BPM", title, self.new_project_bpm);
                         self.show_project_dialog = false;
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.label("Quick Switch Known Songs:");
-                    if ui.button("• The White Flame (Verse 1)").clicked() {
-                        self.project_path_input = "doc/songs/the_white_flame.json".to_string();
                     }
                 });
         }
 
         // Song Section Manager Modal Dialog
         if self.show_section_dialog {
-            egui::Window::new("🎼 Section Manager")
+            egui::Window::new("🎼 Add Song Section")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.set_width(460.0);
-                    ui.heading("Add Song Section");
-                    ui.small("Sections define song structure with tick precision (960 PPQ).");
+                    ui.set_width(420.0);
+                    ui.heading("Add Section");
+                    ui.small("Sections define song structure. Length is content-driven and automatically calculated from track blocks.");
                     ui.add_space(8.0);
 
                     ui.label("Presets:");
                     ui.horizontal_wrapped(|ui| {
                         let presets = [
-                            ("Intro (4 bars)", "Intro", 15360),
-                            ("Verse 1 (4 bars)", "Verse 1", 15360),
-                            ("Chorus 1 (4 bars)", "Chorus 1", 15360),
-                            ("Bridge (4 bars)", "Bridge", 15360),
-                            ("Outro (4 bars)", "Outro", 15360),
-                            ("Pickup (2 beats)", "Pickup", 1920),
-                            ("Break (1 bar)", "Break", 3840),
+                            "Intro", "Verse 1", "Verse 2", "Chorus 1", "Chorus 2", "Bridge", "Solo", "Outro", "Breakdown"
                         ];
-                        for (label, name, len) in presets {
-                            if ui.button(label).clicked() {
+                        for name in presets {
+                            if ui.button(name).clicked() {
                                 self.new_section_name = name.to_string();
-                                self.new_section_length_ticks = len;
                             }
                         }
                     });
@@ -578,45 +658,6 @@ impl eframe::App for JamOutApp {
                     ui.horizontal(|ui| {
                         ui.label("Name:");
                         ui.text_edit_singleline(&mut self.new_section_name);
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Start Tick:");
-                        ui.add(egui::DragValue::new(&mut self.new_section_start_tick).speed(240));
-
-                        let cur_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
-                        if ui.button("📍 At Playhead").clicked() {
-                            self.new_section_start_tick = cur_tick;
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Length Ticks:");
-                        ui.add(egui::DragValue::new(&mut self.new_section_length_ticks).speed(240).range(240..=1000000));
-                    });
-
-                    // Human-readable timing readout
-                    let tpb = 3840u64; // 4/4 ticks per bar
-                    let start_bar = (self.new_section_start_tick / tpb) + 1;
-                    let start_beat = ((self.new_section_start_tick % tpb) as f64 / 960.0) + 1.0;
-                    let bars_f = self.new_section_length_ticks as f64 / 3840.0;
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Starts: Bar {}, Beat {:.2}  |  Length: {:.2} bars ({:.1} beats)",
-                            start_bar, start_beat, bars_f, bars_f * 4.0
-                        )).italics().color(egui::Color32::from_rgb(180, 200, 240))
-                    );
-
-                    ui.horizontal(|ui| {
-                        ui.label("Snap / Normalize:");
-                        if ui.button("🎯 Snap to Beat").on_hover_text("Normalize start and length to nearest quarter note (960 ticks)").clicked() {
-                            self.new_section_start_tick = (self.new_section_start_tick as f64 / 960.0).round() as u64 * 960;
-                            self.new_section_length_ticks = (self.new_section_length_ticks as f64 / 960.0).round().max(1.0) as u64 * 960;
-                        }
-                        if ui.button("🎯 Snap to Bar").on_hover_text("Normalize start and length to nearest 4/4 bar (3840 ticks)").clicked() {
-                            self.new_section_start_tick = (self.new_section_start_tick as f64 / 3840.0).round() as u64 * 3840;
-                            self.new_section_length_ticks = (self.new_section_length_ticks as f64 / 3840.0).round().max(1.0) as u64 * 3840;
-                        }
                     });
 
                     ui.horizontal(|ui| {
@@ -635,12 +676,11 @@ impl eframe::App for JamOutApp {
                                 self.send_cmd(IpcCommand::AddSection {
                                     id: id.clone(),
                                     name: name.to_string(),
-                                    start_tick: self.new_section_start_tick,
-                                    length_ticks: self.new_section_length_ticks,
+                                    start_tick: 0,
+                                    length_ticks: 0,
                                     energy: self.new_section_energy,
                                 });
                                 self.status_msg = format!("Added section '{}'", name);
-                                self.new_section_start_tick += self.new_section_length_ticks;
                                 self.show_section_dialog = false;
                             }
                         }
@@ -1153,7 +1193,6 @@ impl JamOutApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("➕ Add Section").on_hover_text("Define or append a new song section").clicked() {
-                    self.new_section_start_tick = total_ticks;
                     self.show_section_dialog = true;
                 }
             });
@@ -1372,7 +1411,6 @@ impl JamOutApp {
                 ui.allocate_ui(egui::vec2(120.0, 52.0), |ui| {
                     ui.set_width(120.0);
                     if ui.button("➕ New Section").clicked() {
-                        self.new_section_start_tick = total_ticks;
                         self.show_section_dialog = true;
                     }
                 });
