@@ -1920,25 +1920,29 @@ impl JamOutApp {
                     egui::vec2(TRACK_HEADER_WIDTH, SECTION_HEADER_HEIGHT),
                     egui::Sense::hover(),
                 );
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tl_rect), |ui| {
-                    ui.vertical(|ui| {
-                        ui.strong("TRACKS");
-                        ui.horizontal(|ui| {
-                            if ui.small_button("➕ MIDI").clicked() {
-                                let count = tracks.len() + 1;
-                                let id = format!("track_{}", count);
-                                let name = format!("MIDI Track {}", count);
-                                self.send_cmd(IpcCommand::AddTrack { id: id.clone(), name: name.clone(), track_type: "synth".to_string() });
-                                self.track_name_edits.insert(id, name);
-                            }
-                            if ui.small_button("➕ Audio").clicked() {
-                                let count = tracks.len() + 1;
-                                let id = format!("audio_{}", count);
-                                let name = format!("Audio Track {}", count);
-                                self.send_cmd(IpcCommand::AddTrack { id: id.clone(), name: name.clone(), track_type: "audio".to_string() });
-                                self.track_name_edits.insert(id, name);
-                            }
-                        });
+                ui.painter().rect_filled(
+                    tl_rect,
+                    2.0,
+                    egui::Color32::from_rgb(28, 32, 40),
+                );
+                let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(tl_rect.shrink(4.0)));
+                child_ui.vertical(|ui| {
+                    ui.strong("TRACKS");
+                    ui.horizontal(|ui| {
+                        if ui.small_button("➕ MIDI").clicked() {
+                            let count = tracks.len() + 1;
+                            let id = format!("track_{}", count);
+                            let name = format!("MIDI Track {}", count);
+                            self.send_cmd(IpcCommand::AddTrack { id: id.clone(), name: name.clone(), track_type: "synth".to_string() });
+                            self.track_name_edits.insert(id, name);
+                        }
+                        if ui.small_button("➕ Audio").clicked() {
+                            let count = tracks.len() + 1;
+                            let id = format!("audio_{}", count);
+                            let name = format!("Audio Track {}", count);
+                            self.send_cmd(IpcCommand::AddTrack { id: id.clone(), name: name.clone(), track_type: "audio".to_string() });
+                            self.track_name_edits.insert(id, name);
+                        }
                     });
                 });
 
@@ -1973,43 +1977,42 @@ impl JamOutApp {
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 65, 80)),
                     );
 
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(sec_hdr_rect.shrink(4.0)), |ui| {
-                        ui.vertical(|ui| {
-                            // Row 1: Section Name + [▶ Seek] + [⚙ Properties]
-                            ui.horizontal(|ui| {
-                                ui.strong(egui::RichText::new(&sec.name).color(egui::Color32::WHITE));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("⚙").on_hover_text("Open Section Properties (Name, Length, Meter, Tempo)").clicked() {
-                                        self.open_section_properties(sec);
-                                    }
-                                    if ui.small_button("▶").on_hover_text("Seek playhead to section downbeat").clicked() {
-                                        self.send_cmd(IpcCommand::Seek { tick: sec_start_tick });
-                                    }
-                                });
+                    let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(sec_hdr_rect.shrink(4.0)));
+                    child_ui.vertical(|ui| {
+                        // Row 1: Section Name + [▶ Seek] + [⚙ Properties]
+                        ui.horizontal(|ui| {
+                            ui.strong(egui::RichText::new(&sec.name).color(egui::Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⚙").on_hover_text("Open Section Properties (Name, Length, Meter, Tempo)").clicked() {
+                                    self.open_section_properties(sec);
+                                }
+                                if ui.small_button("▶").on_hover_text("Seek playhead to section downbeat").clicked() {
+                                    self.send_cmd(IpcCommand::Seek { tick: sec_start_tick });
+                                }
                             });
-
-                            // Row 2: Summary info
-                            let sec_eff_ts = sec.time_signature.unwrap_or(project_ts);
-                            let eff_bpm = sec.effective_bpm(project_bpm);
-                            let length_str = if sec_len == 0 {
-                                "Empty (0t)".to_string()
-                            } else {
-                                let tpb = sec_eff_ts.ticks_per_bar().max(1);
-                                let bars = sec_len as f64 / tpb as f64;
-                                format!("{:.1}b ({}t)", bars, sec_len)
-                            };
-                            let tempo_str = match sec.tempo {
-                                Some(TempoOverride::AbsoluteBpm(b)) => format!("{:.1} BPM", b),
-                                Some(TempoOverride::Ratio(n, d)) => format!("{}:{} ({:.1} BPM)", n, d, eff_bpm),
-                                None => format!("{:.1} BPM", eff_bpm),
-                            };
-                            let meter_str = format!("{}/{}", sec_eff_ts.numerator, sec_eff_ts.denominator);
-
-                            ui.small(
-                                egui::RichText::new(format!("{} • {} • {}", length_str, meter_str, tempo_str))
-                                    .color(egui::Color32::from_rgb(175, 185, 205))
-                            );
                         });
+
+                        // Row 2: Summary info
+                        let sec_eff_ts = sec.time_signature.unwrap_or(project_ts);
+                        let eff_bpm = sec.effective_bpm(project_bpm);
+                        let length_str = if sec_len == 0 {
+                            "Empty (0t)".to_string()
+                        } else {
+                            let tpb = sec_eff_ts.ticks_per_bar().max(1);
+                            let bars = sec_len as f64 / tpb as f64;
+                            format!("{:.1}b ({}t)", bars, sec_len)
+                        };
+                        let tempo_str = match sec.tempo {
+                            Some(TempoOverride::AbsoluteBpm(b)) => format!("{:.1} BPM", b),
+                            Some(TempoOverride::Ratio(n, d)) => format!("{}:{} ({:.1} BPM)", n, d, eff_bpm),
+                            None => format!("{:.1} BPM", eff_bpm),
+                        };
+                        let meter_str = format!("{}/{}", sec_eff_ts.numerator, sec_eff_ts.denominator);
+
+                        ui.small(
+                            egui::RichText::new(format!("{} • {} • {}", length_str, meter_str, tempo_str))
+                                .color(egui::Color32::from_rgb(175, 185, 205))
+                        );
                     });
 
                     ui.separator();
@@ -2020,12 +2023,11 @@ impl JamOutApp {
                     egui::vec2(100.0, SECTION_HEADER_HEIGHT),
                     egui::Sense::hover(),
                 );
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(new_sec_rect), |ui| {
-                    ui.centered_and_justified(|ui| {
-                        if ui.button("➕ Section").on_hover_text("Add a new song section").clicked() {
-                            self.show_section_dialog = true;
-                        }
-                    });
+                let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(new_sec_rect));
+                child_ui.centered_and_justified(|ui| {
+                    if ui.button("➕ Section").on_hover_text("Add a new song section").clicked() {
+                        self.show_section_dialog = true;
+                    }
                 });
             });
 
@@ -2041,53 +2043,57 @@ impl JamOutApp {
                         egui::vec2(TRACK_HEADER_WIDTH, TRACK_ROW_HEIGHT),
                         egui::Sense::hover(),
                     );
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hdr_rect), |ui| {
-                        ui.vertical(|ui| {
-                            let (need_rename, new_name_str) = {
-                                let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
-                                let resp = ui.add(egui::TextEdit::singleline(current_buf).desired_width(TRACK_HEADER_WIDTH - 20.0));
-                                if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
-                                    (true, current_buf.trim().to_string())
+                    ui.painter().rect_filled(
+                        hdr_rect,
+                        2.0,
+                        egui::Color32::from_rgb(28, 32, 40),
+                    );
+                    let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(hdr_rect.shrink(4.0)));
+                    child_ui.vertical(|ui| {
+                        let (need_rename, new_name_str) = {
+                            let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
+                            let resp = ui.add(egui::TextEdit::singleline(current_buf).desired_width(TRACK_HEADER_WIDTH - 20.0));
+                            if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
+                                (true, current_buf.trim().to_string())
+                            } else {
+                                (false, String::new())
+                            }
+                        };
+                        if need_rename {
+                            self.send_cmd(IpcCommand::RenameTrack { track_id: track.id.clone(), new_name: new_name_str.clone() });
+                            self.status_msg = format!("Renamed track to '{}'", new_name_str);
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.small(if track.current_bpm > 0.0 { format!("{:.1} BPM", track.current_bpm) } else { format!("{:.1} BPM", project_bpm) });
+
+                            if ui.small_button("🎹").on_hover_text("Open Piano Roll for this track").clicked() {
+                                if let Some((s_id, _)) = sections.iter().find_map(|s| s.track_blocks.get(&track.id).map(|_| (s.id.clone(), track.id.clone()))) {
+                                    self.open_piano_roll_block = Some((s_id.clone(), track.id.clone()));
+                                    self.selected_block = Some((s_id, track.id.clone()));
+                                    self.selected_track_id = track.id.clone();
                                 } else {
-                                    (false, String::new())
+                                    self.status_msg = format!("Track '{}' has no blocks yet. Click '+ Add Block' in a section.", track.name);
                                 }
-                            };
-                            if need_rename {
-                                self.send_cmd(IpcCommand::RenameTrack { track_id: track.id.clone(), new_name: new_name_str.clone() });
-                                self.status_msg = format!("Renamed track to '{}'", new_name_str);
+                            }
+                            if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP").clicked() {
+                                self.edit_master_insert_slot = None;
+                                self.edit_track_id = Some(track.id.clone());
                             }
 
-                            ui.horizontal(|ui| {
-                                ui.small(if track.current_bpm > 0.0 { format!("{:.1} BPM", track.current_bpm) } else { format!("{:.1} BPM", project_bpm) });
+                            let mut muted = track.muted;
+                            if ui.toggle_value(&mut muted, "M").clicked() {
+                                self.send_cmd(IpcCommand::SetMute { track_id: track.id.clone(), muted });
+                            }
 
-                                if ui.small_button("🎹").on_hover_text("Open Piano Roll for this track").clicked() {
-                                    if let Some((s_id, _)) = sections.iter().find_map(|s| s.track_blocks.get(&track.id).map(|_| (s.id.clone(), track.id.clone()))) {
-                                        self.open_piano_roll_block = Some((s_id.clone(), track.id.clone()));
-                                        self.selected_block = Some((s_id, track.id.clone()));
-                                        self.selected_track_id = track.id.clone();
-                                    } else {
-                                        self.status_msg = format!("Track '{}' has no blocks yet. Click '+ Add Block' in a section.", track.name);
-                                    }
-                                }
-                                if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP").clicked() {
-                                    self.edit_master_insert_slot = None;
-                                    self.edit_track_id = Some(track.id.clone());
-                                }
+                            let mut solo = track.solo;
+                            if ui.toggle_value(&mut solo, "S").clicked() {
+                                self.send_cmd(IpcCommand::SetSolo { track_id: track.id.clone(), solo });
+                            }
 
-                                let mut muted = track.muted;
-                                if ui.toggle_value(&mut muted, "M").clicked() {
-                                    self.send_cmd(IpcCommand::SetMute { track_id: track.id.clone(), muted });
-                                }
-
-                                let mut solo = track.solo;
-                                if ui.toggle_value(&mut solo, "S").clicked() {
-                                    self.send_cmd(IpcCommand::SetSolo { track_id: track.id.clone(), solo });
-                                }
-
-                                if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
-                                    self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
-                                }
-                            });
+                            if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
+                            }
                         });
                     });
 
@@ -2280,20 +2286,19 @@ impl JamOutApp {
                             }
                         } else {
                             // Empty / Rest Cell (Silence for this track in this section)
-                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_rect), |ui| {
-                                ui.centered_and_justified(|ui| {
-                                    if ui.small_button("➕ Add Block").on_hover_text("Add a track block / pattern to this section").clicked() {
-                                        let block_id = format!("{}_{}", sec.id, track.id);
-                                        let new_block = TrackBlock::new(&block_id, &track.id, 3840);
-                                        self.send_cmd(IpcCommand::SetTrackBlock {
-                                            section_id: sec.id.clone(),
-                                            block: new_block,
-                                        });
-                                        self.selected_block = Some((sec.id.clone(), track.id.clone()));
-                                        self.selected_track_id = track.id.clone();
-                                        self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
-                                    }
-                                });
+                            let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(cell_rect));
+                            child_ui.centered_and_justified(|ui| {
+                                if ui.small_button("➕ Add Block").on_hover_text("Add a track block / pattern to this section").clicked() {
+                                    let block_id = format!("{}_{}", sec.id, track.id);
+                                    let new_block = TrackBlock::new(&block_id, &track.id, 3840);
+                                    self.send_cmd(IpcCommand::SetTrackBlock {
+                                        section_id: sec.id.clone(),
+                                        block: new_block,
+                                    });
+                                    self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                                    self.selected_track_id = track.id.clone();
+                                    self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
+                                }
                             });
                         }
 
@@ -2312,11 +2317,10 @@ impl JamOutApp {
                     }
 
                     // Matching tail cell under the New Section column
-                    let (tail_rect, _) = ui.allocate_exact_size(
+                    let (_tail_rect, _) = ui.allocate_exact_size(
                         egui::vec2(100.0, TRACK_ROW_HEIGHT),
                         egui::Sense::hover(),
                     );
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tail_rect), |_| {});
                 });
 
                 ui.add_space(2.0);
