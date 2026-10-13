@@ -70,6 +70,7 @@ struct JamOutApp {
     // Piano roll state
     pub selected_track_id: String,
     pub piano_roll_note_pitch: u8,
+    pub piano_roll_scroll_y: Option<f32>,
 
     // Track editing state
     pub track_name_edits: HashMap<String, String>,
@@ -312,6 +313,7 @@ impl JamOutApp {
             new_section_name: "Verse 1".to_string(),
             selected_track_id: "bass".to_string(),
             piano_roll_note_pitch: 50, // D3 default
+            piano_roll_scroll_y: Some(472.0), // Center on Middle C (C4) initially
             track_name_edits: HashMap::new(),
             edit_track_id: None,
             edit_insert_slot: None,
@@ -2060,20 +2062,91 @@ impl JamOutApp {
 
         let current_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
 
-        // 2 Octaves displayed (C2 = 36 to C5 = 72)
-        let min_note = 36u8; // C2
-        let max_note = 72u8; // C5
+        // 8 Full Octaves displayed (C0 = 12 to C8 = 108)
+        let min_note = 12u8; // C0
+        let max_note = 108u8; // C8
         let num_notes = (max_note - min_note + 1) as usize;
         let row_height = 14.0f32;
 
-        egui::ScrollArea::both().show(ui, |ui| {
+        // Octave Jump and Viewport Navigation Toolbar
+        ui.horizontal(|ui| {
+            ui.label("Jump:");
+            if ui.small_button("Sub (C1)").on_hover_text("Jump to C1 (MIDI 24)").clicked() {
+                self.piano_roll_scroll_y = Some(((max_note - 24) as f32 * row_height - 180.0).max(0.0));
+            }
+            if ui.small_button("Bass (C2)").on_hover_text("Jump to C2 (MIDI 36)").clicked() {
+                self.piano_roll_scroll_y = Some(((max_note - 36) as f32 * row_height - 180.0).max(0.0));
+            }
+            if ui.small_button("Tenor (C3)").on_hover_text("Jump to C3 (MIDI 48)").clicked() {
+                self.piano_roll_scroll_y = Some(((max_note - 48) as f32 * row_height - 180.0).max(0.0));
+            }
+            if ui.small_button("Mid (C4)").on_hover_text("Jump to Middle C (MIDI 60)").clicked() {
+                self.piano_roll_scroll_y = Some(((max_note - 60) as f32 * row_height - 180.0).max(0.0));
+            }
+            if ui.small_button("Treble (C5)").on_hover_text("Jump to C5 (MIDI 72)").clicked() {
+                self.piano_roll_scroll_y = Some(((max_note - 72) as f32 * row_height - 180.0).max(0.0));
+            }
+            if ui.small_button("High (C6)").on_hover_text("Jump to C6 (MIDI 84)").clicked() {
+                self.piano_roll_scroll_y = Some(((max_note - 84) as f32 * row_height - 180.0).max(0.0));
+            }
+            if ui.small_button("Air (C7)").on_hover_text("Jump to C7 (MIDI 96)").clicked() {
+                self.piano_roll_scroll_y = Some(((max_note - 96) as f32 * row_height - 180.0).max(0.0));
+            }
+
+            ui.separator();
+
+            let pitches: Vec<u8> = track_events.iter().filter_map(|e| {
+                if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = e.action {
+                    Some(note)
+                } else {
+                    None
+                }
+            }).collect();
+
+            let focus_tooltip = if pitches.is_empty() {
+                "No notes on this track yet (will center on Middle C)".to_string()
+            } else {
+                let min_p = pitches.iter().min().unwrap();
+                let max_p = pitches.iter().max().unwrap();
+                format!("Center viewport on active notes (range: MIDI {} - {})", min_p, max_p)
+            };
+
+            if ui.small_button("🎯 Focus Notes").on_hover_text(focus_tooltip).clicked() {
+                if !pitches.is_empty() {
+                    let avg = pitches.iter().map(|&p| p as f32).sum::<f32>() / pitches.len() as f32;
+                    self.piano_roll_scroll_y = Some(((max_note as f32 - avg) * row_height - 180.0).max(0.0));
+                } else {
+                    self.piano_roll_scroll_y = Some(((max_note - 60) as f32 * row_height - 180.0).max(0.0));
+                }
+            }
+
+            ui.separator();
+            ui.small("Range: C0 (12) - C8 (108)");
+        });
+
+        ui.add_space(4.0);
+
+        let mut scroll = egui::ScrollArea::both();
+        if let Some(offset_y) = self.piano_roll_scroll_y.take() {
+            scroll = scroll.vertical_scroll_offset(offset_y);
+        }
+
+        scroll.show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Left Keyboard Column (Piano Keys)
-                let keyboard_width = 50.0;
-                let (key_rect, _key_resp) = ui.allocate_exact_size(
+                let keyboard_width = 54.0;
+                let (key_rect, key_resp) = ui.allocate_exact_size(
                     egui::vec2(keyboard_width, num_notes as f32 * row_height),
                     egui::Sense::click(),
                 );
+
+                if key_resp.clicked() {
+                    if let Some(pos) = key_resp.interact_pointer_pos() {
+                        let row_idx = ((pos.y - key_rect.top()) / row_height).floor() as u8;
+                        let clicked_pitch = max_note.saturating_sub(row_idx);
+                        self.piano_roll_note_pitch = clicked_pitch;
+                    }
+                }
 
                 let key_painter = ui.painter();
                 let note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -2083,18 +2156,44 @@ impl JamOutApp {
                     let y = key_rect.top() + i as f32 * row_height;
                     let r = egui::Rect::from_min_size(egui::pos2(key_rect.left(), y), egui::vec2(keyboard_width, row_height));
 
+                    let is_c = pitch % 12 == 0;
                     let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
-                    let key_bg = if is_black { egui::Color32::from_rgb(30, 30, 35) } else { egui::Color32::from_rgb(220, 220, 225) };
+                    let is_active_pitch = pitch == self.piano_roll_note_pitch;
+
+                    let key_bg = if is_active_pitch {
+                        egui::Color32::from_rgb(65, 130, 220)
+                    } else if is_c {
+                        egui::Color32::from_rgb(240, 240, 252)
+                    } else if is_black {
+                        egui::Color32::from_rgb(28, 28, 34)
+                    } else {
+                        egui::Color32::from_rgb(215, 215, 222)
+                    };
                     key_painter.rect_filled(r, 1.0, key_bg);
+
+                    if is_c {
+                        key_painter.line_segment(
+                            [egui::pos2(r.left(), r.bottom()), egui::pos2(r.right(), r.bottom())],
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 140, 240)),
+                        );
+                    }
 
                     let name = note_names[(pitch % 12) as usize];
                     let oct = (pitch / 12) as i32 - 1;
-                    let text_color = if is_black { egui::Color32::LIGHT_GRAY } else { egui::Color32::BLACK };
+                    let text_color = if is_active_pitch {
+                        egui::Color32::WHITE
+                    } else if is_black {
+                        egui::Color32::LIGHT_GRAY
+                    } else if is_c {
+                        egui::Color32::from_rgb(15, 45, 130)
+                    } else {
+                        egui::Color32::BLACK
+                    };
                     key_painter.text(
                         egui::pos2(r.left() + 4.0, r.top() + 1.0),
                         egui::Align2::LEFT_TOP,
                         format!("{}{}", name, oct),
-                        egui::FontId::proportional(10.0),
+                        egui::FontId::proportional(if is_c { 10.5 } else { 9.5 }),
                         text_color,
                     );
                 }
@@ -2247,9 +2346,17 @@ impl JamOutApp {
                     let pitch = max_note - i as u8;
                     let y = grid_rect.top() + i as f32 * row_height;
                     let r = egui::Rect::from_min_size(egui::pos2(grid_rect.left(), y), egui::vec2(grid_width, row_height));
+                    let is_c = pitch % 12 == 0;
                     let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
                     let row_bg = if is_black { egui::Color32::from_rgb(22, 22, 28) } else { egui::Color32::from_rgb(32, 32, 38) };
                     grid_painter.rect_filled(r, 0.0, row_bg);
+
+                    if is_c {
+                        grid_painter.line_segment(
+                            [egui::pos2(grid_rect.left(), r.bottom()), egui::pos2(grid_rect.right(), r.bottom())],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 140, 240, 50)),
+                        );
+                    }
                 }
 
                 // Vertical 16th-note & Bar lines
