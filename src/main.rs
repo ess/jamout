@@ -2957,27 +2957,85 @@ impl JamOutApp {
                         self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", block.id, clicked_pitch, final_tick, self.note_duration_ticks);
                     }
                 } else if grid_resp.secondary_clicked() {
-                    // Right click deletes note
+                    // Right click deletes note anywhere along its duration
                     if let Some(pos) = grid_resp.interact_pointer_pos() {
                         let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                         let clicked_tick = (pct_x * total_ticks as f32) as u64;
                         let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
                         let clicked_pitch = max_note.saturating_sub(row_idx);
 
-                        let mut updated = block.clone();
-                        updated.events.retain(|e| {
-                            if (e.tick as i64 - clicked_tick as i64).abs() <= 120 {
-                                match e.action {
-                                    jamseq::timeline::ScheduledAction::NoteOn { note, .. } => note != clicked_pitch,
-                                    jamseq::timeline::ScheduledAction::NoteOff { note } => note != clicked_pitch,
-                                    _ => true,
+                        let mut on_idx = None;
+                        let mut off_idx = None;
+
+                        // 1. Check if clicked_tick falls within any note's [start, end] span
+                        for (i, ev) in block.events.iter().enumerate() {
+                            if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
+                                if note == clicked_pitch {
+                                    let note_off = block.events.iter().enumerate().skip(i + 1).find(|(_, off_ev)| {
+                                        off_ev.tick > ev.tick
+                                            && match off_ev.action {
+                                                jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
+                                                _ => false,
+                                            }
+                                    });
+                                    let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
+                                    let duration = note_off_tick.saturating_sub(ev.tick).max(60);
+                                    let min_ticks = ((6.0 / grid_rect.width().max(1.0)) * total_ticks as f32) as u64;
+                                    let end_tick = (ev.tick + duration).max(ev.tick + min_ticks);
+
+                                    let tolerance = 40u64;
+                                    if clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick <= end_tick + tolerance {
+                                        on_idx = Some(i);
+                                        off_idx = note_off.map(|(off_i, _)| off_i);
+                                        break;
+                                    }
                                 }
-                            } else {
-                                true
                             }
-                        });
-                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                        self.status_msg = format!("Block '{}': Deleted note {} near tick {}", block.id, clicked_pitch, clicked_tick);
+                        }
+
+                        // 2. Fallback: check proximity within 120 ticks of note boundaries
+                        if on_idx.is_none() {
+                            let mut closest_dist = i64::MAX;
+                            for (i, ev) in block.events.iter().enumerate() {
+                                if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
+                                    if note == clicked_pitch {
+                                        let note_off = block.events.iter().enumerate().skip(i + 1).find(|(_, off_ev)| {
+                                            off_ev.tick > ev.tick
+                                                && match off_ev.action {
+                                                jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
+                                                _ => false,
+                                            }
+                                        });
+                                        let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
+                                        let start_dist = (ev.tick as i64 - clicked_tick as i64).abs();
+                                        let end_dist = (note_off_tick as i64 - clicked_tick as i64).abs();
+                                        let d = start_dist.min(end_dist);
+                                        if d <= 120 && d < closest_dist {
+                                            closest_dist = d;
+                                            on_idx = Some(i);
+                                            off_idx = note_off.map(|(off_i, _)| off_i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Remove both NoteOn and corresponding NoteOff
+                        if let Some(on_i) = on_idx {
+                            let mut updated = block.clone();
+                            let mut indices_to_remove = vec![on_i];
+                            if let Some(off_i) = off_idx {
+                                indices_to_remove.push(off_i);
+                            }
+                            indices_to_remove.sort_unstable_by(|a, b| b.cmp(a));
+                            for idx in indices_to_remove {
+                                if idx < updated.events.len() {
+                                    updated.events.remove(idx);
+                                }
+                            }
+                            self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
+                            self.status_msg = format!("Block '{}': Deleted note {} at tick {}", block.id, clicked_pitch, clicked_tick);
+                        }
                     }
                 }
 
