@@ -2,7 +2,7 @@ mod search_input;
 mod sliding_panel;
 
 use eframe::egui;
-use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse};
+use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse, ParamType, TrackParamStatus};
 use jamseq::timeline::{LoopMode, TempoOverride, TimeSignature, TrackBlock};
 use search_input::{SearchInput, SearchablePicker};
 use sliding_panel::SlidingPanelStack;
@@ -83,6 +83,7 @@ struct JamOutApp {
     pub param_search_filter: String,
     pub plugin_search_filter: String,
     pub insert_search_filter: String,
+    pub effect_param_search_filter: String,
 
     // Note duration and drag drawing state
     pub note_duration_ticks: u64,
@@ -329,6 +330,7 @@ impl JamOutApp {
             param_search_filter: String::new(),
             plugin_search_filter: String::new(),
             insert_search_filter: String::new(),
+            effect_param_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
             drag_start: None,
             selected_block: None,
@@ -411,6 +413,115 @@ fn normalize_jam_path(path: &std::path::Path) -> std::path::PathBuf {
         std::path::PathBuf::from(format!("{}.jam.json", stem))
     } else {
         std::path::PathBuf::from(format!("{}.jam.json", s))
+    }
+}
+
+fn render_grouped_parameter_list<F>(
+    ui: &mut egui::Ui,
+    id_salt_prefix: &str,
+    params: &[TrackParamStatus],
+    filter_text: &str,
+    mut on_change: F,
+) where
+    F: FnMut(&str, f32),
+{
+    let filter_lower = filter_text.trim().to_lowercase();
+    let filtered_params: Vec<&TrackParamStatus> = params
+        .iter()
+        .filter(|p| {
+            if filter_lower.is_empty() {
+                true
+            } else {
+                p.name.to_lowercase().contains(&filter_lower) || p.group.to_lowercase().contains(&filter_lower)
+            }
+        })
+        .collect();
+
+    if filtered_params.is_empty() {
+        ui.label("No parameters match the search filter.");
+        return;
+    }
+
+    // Preserve original discovery / plugin parameter order when grouping
+    let mut groups: Vec<(String, Vec<&TrackParamStatus>)> = Vec::new();
+    for p in filtered_params {
+        if let Some((_, list)) = groups.iter_mut().find(|(g, _)| g == &p.group) {
+            list.push(p);
+        } else {
+            groups.push((p.group.clone(), vec![p]));
+        }
+    }
+
+    for (group_name, group_params) in groups {
+        egui::CollapsingHeader::new(format!("📁 {} ({})", group_name, group_params.len()))
+            .id_salt(format!("{}_grp_{}", id_salt_prefix, group_name))
+            .default_open(true)
+            .show(ui, |ui| {
+                for param in group_params {
+                    ui.horizontal(|ui| {
+                        ui.set_min_width(130.0);
+                        let label = match param.name.as_str() {
+                            "cutoff" => "Cutoff (Hz)",
+                            "resonance" => "Resonance",
+                            "glide_ms" => "Glide (ms)",
+                            "drive" => "Drive / Sat",
+                            "attack_ms" => "Attack (ms)",
+                            "decay_ms" => "Decay (ms)",
+                            "sustain" => "Sustain",
+                            "release_ms" => "Release (ms)",
+                            other => other,
+                        };
+                        ui.label(label);
+
+                        match &param.param_type {
+                            ParamType::Bool => {
+                                let mut b = param.value > 0.5;
+                                let chk_label = if b { "On" } else { "Off" };
+                                if ui.checkbox(&mut b, chk_label).changed() {
+                                    on_change(&param.name, if b { 1.0 } else { 0.0 });
+                                }
+                            }
+                            ParamType::Enum { labels } => {
+                                let current_idx = (param.value - param.min).round() as usize;
+                                let current_label = labels.get(current_idx).cloned()
+                                    .or_else(|| param.display_value.clone())
+                                    .unwrap_or_else(|| format!("{:.0}", param.value));
+
+                                egui::ComboBox::from_id_salt(format!("{}_enum_{}", id_salt_prefix, param.name))
+                                    .selected_text(current_label)
+                                    .show_ui(ui, |ui| {
+                                        for (i, lbl) in labels.iter().enumerate() {
+                                            let is_selected = i == current_idx;
+                                            if ui.selectable_label(is_selected, lbl).clicked() {
+                                                on_change(&param.name, param.min + i as f32);
+                                            }
+                                        }
+                                    });
+                            }
+                            ParamType::Int => {
+                                let mut val = param.value.round() as i64;
+                                let min_i = param.min.round() as i64;
+                                let max_i = param.max.round() as i64;
+                                if ui.add(egui::Slider::new(&mut val, min_i..=max_i).step_by(1.0)).changed() {
+                                    on_change(&param.name, val as f32);
+                                }
+                                if let Some(ref disp) = param.display_value {
+                                    ui.monospace(disp);
+                                }
+                            }
+                            ParamType::Float => {
+                                let mut val = param.value;
+                                if ui.add(egui::Slider::new(&mut val, param.min..=param.max)).changed() {
+                                    on_change(&param.name, val);
+                                }
+                                if let Some(ref disp) = param.display_value {
+                                    ui.monospace(disp);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
     }
 }
 
@@ -1064,52 +1175,23 @@ impl eframe::App for JamOutApp {
                             });
                             ui.add_space(4.0);
 
-                            let filter_lower = self.param_search_filter.trim().to_lowercase();
-                            let filtered_params: Vec<_> = track
-                                .params
-                                .iter()
-                                .filter(|p| {
-                                    if filter_lower.is_empty() {
-                                        true
-                                    } else {
-                                        p.name.to_lowercase().contains(&filter_lower)
-                                    }
-                                })
-                                .collect();
-
                             egui::ScrollArea::vertical()
-                                .max_height(250.0)
+                                .max_height(280.0)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    if filtered_params.is_empty() {
-                                        ui.label("No parameters match the search filter.");
-                                    } else {
-                                        for param in filtered_params {
-                                            let mut val = param.value;
-                                            ui.horizontal(|ui| {
-                                                let label = match param.name.as_str() {
-                                                    "cutoff" => "Cutoff (Hz)",
-                                                    "resonance" => "Resonance",
-                                                    "glide_ms" => "Glide (ms)",
-                                                    "drive" => "Drive / Sat",
-                                                    "attack_ms" => "Attack (ms)",
-                                                    "decay_ms" => "Decay (ms)",
-                                                    "sustain" => "Sustain",
-                                                    "release_ms" => "Release (ms)",
-                                                    other => other,
-                                                };
-                                                ui.set_min_width(120.0);
-                                                ui.label(label);
-                                                if ui.add(egui::Slider::new(&mut val, param.min..=param.max)).changed() {
-                                                    self.send_cmd(IpcCommand::SetTrackParam {
-                                                        track_id: track.id.clone(),
-                                                        param_name: param.name.clone(),
-                                                        value: val,
-                                                    });
-                                                }
+                                    render_grouped_parameter_list(
+                                        ui,
+                                        &format!("track_{}", track.id),
+                                        &track.params,
+                                        &self.param_search_filter,
+                                        |name, val| {
+                                            self.send_cmd(IpcCommand::SetTrackParam {
+                                                track_id: track.id.clone(),
+                                                param_name: name.to_string(),
+                                                value: val,
                                             });
-                                        }
-                                    }
+                                        },
+                                    );
                                 });
 
                             ui.add_space(8.0);
@@ -1257,28 +1339,38 @@ impl eframe::App for JamOutApp {
                                         if ins.params.is_empty() {
                                             ui.label("No exposed control parameters for this plugin.");
                                         } else {
-                                            ui.label(format!("Parameters ({})", ins.params.len()));
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("Parameters ({})", ins.params.len()));
+                                                if ins.params.len() > 6 {
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.add(
+                                                            SearchInput::new(&mut self.effect_param_search_filter, "🔍 Search parameters...")
+                                                                .id_salt("effect_param_search_input")
+                                                                .desired_width(180.0)
+                                                        );
+                                                    });
+                                                }
+                                            });
                                             ui.add_space(4.0);
 
                                             egui::ScrollArea::vertical()
                                                 .max_height(350.0)
                                                 .auto_shrink([false, false])
                                                 .show(ui, |ui| {
-                                                    for p in &ins.params {
-                                                        let mut val = p.value;
-                                                        ui.horizontal(|ui| {
-                                                            ui.set_min_width(120.0);
-                                                            ui.label(&p.name);
-                                                            if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
-                                                                self.send_cmd(IpcCommand::SetTrackInsertParam {
-                                                                    track_id: tr_id.clone(),
-                                                                    insert_index: ins_idx,
-                                                                    param_name: p.name.clone(),
-                                                                    value: val,
-                                                                });
-                                                            }
-                                                        });
-                                                    }
+                                                    render_grouped_parameter_list(
+                                                        ui,
+                                                        &format!("insert_{}_{}", tr_id, ins_idx),
+                                                        &ins.params,
+                                                        &self.effect_param_search_filter,
+                                                        |name, val| {
+                                                            self.send_cmd(IpcCommand::SetTrackInsertParam {
+                                                                track_id: tr_id.clone(),
+                                                                insert_index: ins_idx,
+                                                                param_name: name.to_string(),
+                                                                value: val,
+                                                            });
+                                                        },
+                                                    );
                                                 });
                                         }
                                     },
@@ -1325,27 +1417,37 @@ impl eframe::App for JamOutApp {
                         if ins.params.is_empty() {
                             ui.label("No exposed control parameters for this plugin.");
                         } else {
-                            ui.label(format!("Parameters ({})", ins.params.len()));
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Parameters ({})", ins.params.len()));
+                                if ins.params.len() > 6 {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.add(
+                                            SearchInput::new(&mut self.effect_param_search_filter, "🔍 Search parameters...")
+                                                .id_salt("master_effect_param_search_input")
+                                                .desired_width(180.0)
+                                        );
+                                    });
+                                }
+                            });
                             ui.add_space(4.0);
 
                             egui::ScrollArea::vertical()
                                 .max_height(350.0)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    for p in &ins.params {
-                                        let mut val = p.value;
-                                        ui.horizontal(|ui| {
-                                            ui.set_min_width(120.0);
-                                            ui.label(&p.name);
-                                            if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
-                                                self.send_cmd(IpcCommand::SetMasterInsertParam {
-                                                    insert_index: ins_idx,
-                                                    param_name: p.name.clone(),
-                                                    value: val,
-                                                });
-                                            }
-                                        });
-                                    }
+                                    render_grouped_parameter_list(
+                                        ui,
+                                        &format!("master_insert_{}", ins_idx),
+                                        &ins.params,
+                                        &self.effect_param_search_filter,
+                                        |name, val| {
+                                            self.send_cmd(IpcCommand::SetMasterInsertParam {
+                                                insert_index: ins_idx,
+                                                param_name: name.to_string(),
+                                                value: val,
+                                            });
+                                        },
+                                    );
                                 });
                         }
                     },
