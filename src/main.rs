@@ -1921,17 +1921,40 @@ impl JamOutApp {
     }
 
     fn render_piano_roll_view(&mut self, ui: &mut egui::Ui) {
+        let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
+
+        let selected_block_info = if let Some((ref sec_id, ref t_id)) = self.selected_block {
+            if t_id == &self.selected_track_id {
+                self.last_status.as_ref().and_then(|st| {
+                    st.sections.iter()
+                        .find(|s| &s.id == sec_id)
+                        .and_then(|s| s.track_blocks.get(t_id).map(|b| (s.id.clone(), s.name.clone(), b.clone())))
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         ui.horizontal(|ui| {
             ui.heading("🎹 Interactive Piano Roll");
             ui.separator();
 
             // Track Selector
-            let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
             ui.label("Editing Track:");
             for t in &tracks {
                 let is_sel = self.selected_track_id == t.id;
                 if ui.selectable_label(is_sel, &t.name).clicked() {
                     self.selected_track_id = t.id.clone();
+                }
+            }
+
+            if let Some((_, ref sec_name, ref blk)) = selected_block_info {
+                ui.separator();
+                ui.label(egui::RichText::new(format!("🔲 Block Scope: {} ({})", blk.id, sec_name)).color(egui::Color32::from_rgb(255, 215, 0)).strong());
+                if ui.small_button("✕ Full Track").on_hover_text("Switch to editing entire track timeline").clicked() {
+                    self.selected_block = None;
                 }
             }
 
@@ -1960,14 +1983,19 @@ impl JamOutApp {
 
         ui.add_space(6.0);
 
-        let total_ticks = self.last_status.as_ref().map(|s| s.total_ticks).unwrap_or(15360);
-        let current_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
-        let events = self.last_status.as_ref().map(|s| s.events.clone()).unwrap_or_default();
+        let (total_ticks, track_events, is_block_scoped) = if let Some((_, _, ref blk)) = selected_block_info {
+            (blk.base_length_ticks.max(240), blk.events.clone(), true)
+        } else {
+            let total = self.last_status.as_ref().map(|s| s.total_ticks).unwrap_or(15360);
+            let events = self.last_status.as_ref().map(|s| s.events.clone()).unwrap_or_default();
+            let filtered: Vec<jamseq::timeline::ScheduledEvent> = events
+                .into_iter()
+                .filter(|e| e.track_id == self.selected_track_id)
+                .collect();
+            (total, filtered, false)
+        };
 
-        let track_events: Vec<&jamseq::ScheduledEvent> = events
-            .iter()
-            .filter(|e| e.track_id == self.selected_track_id)
-            .collect();
+        let current_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
 
         // 2 Octaves displayed (C2 = 36 to C5 = 72)
         let min_note = 36u8; // C2
@@ -2056,16 +2084,25 @@ impl JamOutApp {
                         };
 
                         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                        self.send_cmd(IpcCommand::AddNote {
-                            note_on_id: now_ms,
-                            note_off_id: now_ms + 1,
-                            track_id: self.selected_track_id.clone(),
-                            tick: start_tick,
-                            duration_ticks: final_duration,
-                            note: pitch,
-                            velocity: 0.9,
-                        });
-                        self.status_msg = format!("Piano roll: Added note {} at tick {} (length: {} ticks)", pitch, start_tick, final_duration);
+                        if is_block_scoped {
+                            if let Some((ref s_id, _, ref blk)) = selected_block_info {
+                                let mut updated = blk.clone();
+                                updated.add_note(now_ms, now_ms + 1, start_tick, final_duration, pitch, 0.9);
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: s_id.clone(), block: updated });
+                                self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", blk.id, pitch, start_tick, final_duration);
+                            }
+                        } else {
+                            self.send_cmd(IpcCommand::AddNote {
+                                note_on_id: now_ms,
+                                note_off_id: now_ms + 1,
+                                track_id: self.selected_track_id.clone(),
+                                tick: start_tick,
+                                duration_ticks: final_duration,
+                                note: pitch,
+                                velocity: 0.9,
+                            });
+                            self.status_msg = format!("Piano roll: Added note {} at tick {} (length: {} ticks)", pitch, start_tick, final_duration);
+                        }
                     }
                 } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() {
                     // Normal single click: places note with currently selected duration
@@ -2085,16 +2122,25 @@ impl JamOutApp {
                         self.piano_roll_note_pitch = clicked_pitch;
 
                         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                        self.send_cmd(IpcCommand::AddNote {
-                            note_on_id: now_ms,
-                            note_off_id: now_ms + 1,
-                            track_id: self.selected_track_id.clone(),
-                            tick: final_tick,
-                            duration_ticks: self.note_duration_ticks,
-                            note: clicked_pitch,
-                            velocity: 0.9,
-                        });
-                        self.status_msg = format!("Piano roll: Added note {} at tick {} (length: {} ticks)", clicked_pitch, final_tick, self.note_duration_ticks);
+                        if is_block_scoped {
+                            if let Some((ref s_id, _, ref blk)) = selected_block_info {
+                                let mut updated = blk.clone();
+                                updated.add_note(now_ms, now_ms + 1, final_tick, self.note_duration_ticks, clicked_pitch, 0.9);
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: s_id.clone(), block: updated });
+                                self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", blk.id, clicked_pitch, final_tick, self.note_duration_ticks);
+                            }
+                        } else {
+                            self.send_cmd(IpcCommand::AddNote {
+                                note_on_id: now_ms,
+                                note_off_id: now_ms + 1,
+                                track_id: self.selected_track_id.clone(),
+                                tick: final_tick,
+                                duration_ticks: self.note_duration_ticks,
+                                note: clicked_pitch,
+                                velocity: 0.9,
+                            });
+                            self.status_msg = format!("Piano roll: Added note {} at tick {} (length: {} ticks)", clicked_pitch, final_tick, self.note_duration_ticks);
+                        }
                     }
                 } else if grid_resp.secondary_clicked() {
                     // Right click deletes note
@@ -2104,12 +2150,31 @@ impl JamOutApp {
                         let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
                         let clicked_pitch = max_note.saturating_sub(row_idx);
 
-                        self.send_cmd(IpcCommand::DeleteNoteAt {
-                            track_id: self.selected_track_id.clone(),
-                            tick: clicked_tick,
-                            note: clicked_pitch,
-                        });
-                        self.status_msg = format!("Piano roll: Deleted note {} near tick {}", clicked_pitch, clicked_tick);
+                        if is_block_scoped {
+                            if let Some((ref s_id, _, ref blk)) = selected_block_info {
+                                let mut updated = blk.clone();
+                                updated.events.retain(|e| {
+                                    if (e.tick as i64 - clicked_tick as i64).abs() <= 120 {
+                                        match e.action {
+                                            jamseq::timeline::ScheduledAction::NoteOn { note, .. } => note != clicked_pitch,
+                                            jamseq::timeline::ScheduledAction::NoteOff { note } => note != clicked_pitch,
+                                            _ => true,
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                });
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: s_id.clone(), block: updated });
+                                self.status_msg = format!("Block '{}': Deleted note {} near tick {}", blk.id, clicked_pitch, clicked_tick);
+                            }
+                        } else {
+                            self.send_cmd(IpcCommand::DeleteNoteAt {
+                                track_id: self.selected_track_id.clone(),
+                                tick: clicked_tick,
+                                note: clicked_pitch,
+                            });
+                            self.status_msg = format!("Piano roll: Deleted note {} near tick {}", clicked_pitch, clicked_tick);
+                        }
                     }
                 }
 
@@ -2154,7 +2219,7 @@ impl JamOutApp {
                                             jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
                                             _ => false,
                                         }
-                                })
+                                    })
                                 .map(|off_ev| off_ev.tick)
                                 .unwrap_or(ev.tick + self.note_duration_ticks);
 
@@ -2199,13 +2264,45 @@ impl JamOutApp {
                 }
 
                 // Playhead
-                if total_ticks > 0 {
-                    let playhead_pct = (current_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                    let playhead_x = grid_rect.left() + grid_rect.width() * playhead_pct;
-                    grid_painter.line_segment(
-                        [egui::pos2(playhead_x, grid_rect.top()), egui::pos2(playhead_x, grid_rect.bottom())],
-                        egui::Stroke::new(2.5, egui::Color32::WHITE),
-                    );
+                let playhead_tick = if is_block_scoped {
+                    if let Some((ref s_id, _, ref blk)) = selected_block_info {
+                        let sec_pos = self.last_status.as_ref().and_then(|st| {
+                            let mut acc = 0u64;
+                            for s in &st.sections {
+                                if &s.id == s_id {
+                                    return Some((acc, s.length_ticks()));
+                                }
+                                acc += s.length_ticks();
+                            }
+                            None
+                        });
+                        if let Some((sec_start, _sec_len)) = sec_pos {
+                            let blk_start = sec_start + blk.start_offset_ticks;
+                            let blk_end = blk_start + blk.effective_length_ticks();
+                            if current_tick >= blk_start && current_tick < blk_end && blk.base_length_ticks > 0 {
+                                Some((current_tick - blk_start) % blk.base_length_ticks)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(current_tick)
+                };
+
+                if let Some(p_tick) = playhead_tick {
+                    if total_ticks > 0 {
+                        let playhead_pct = (p_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
+                        let playhead_x = grid_rect.left() + grid_rect.width() * playhead_pct;
+                        grid_painter.line_segment(
+                            [egui::pos2(playhead_x, grid_rect.top()), egui::pos2(playhead_x, grid_rect.bottom())],
+                            egui::Stroke::new(2.5, egui::Color32::WHITE),
+                        );
+                    }
                 }
             });
         });
