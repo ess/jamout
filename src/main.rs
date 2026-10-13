@@ -3,6 +3,7 @@ mod sliding_panel;
 
 use eframe::egui;
 use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse};
+use jamseq::timeline::{LoopMode, TempoOverride, TrackBlock};
 use search_input::{SearchInput, SearchablePicker};
 use sliding_panel::SlidingPanelStack;
 use std::collections::HashMap;
@@ -28,6 +29,15 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[derive(Clone, Debug)]
+pub struct BlockDragState {
+    pub section_id: String,
+    pub track_id: String,
+    pub initial_offset: u64,
+    pub start_pos_x: f32,
+    pub is_slip_edit: bool,
+}
+
 struct JamOutApp {
     _socket_path: String,
     connected: bool,
@@ -43,7 +53,7 @@ struct JamOutApp {
     lyrics: Vec<LyricLine>,
 
     // Human drift & feel controls
-    pub drift_ticks: i64,
+    pub _drift_ticks: i64,
     pub drag_bias_ticks: i64,
     pub freehand_drift: bool,
 
@@ -78,6 +88,15 @@ struct JamOutApp {
     // Note duration and drag drawing state
     pub note_duration_ticks: u64,
     pub drag_start: Option<(u64, u8)>, // (start_tick, pitch)
+
+    // Matrix Arranger & Block Editing State
+    pub selected_block: Option<(String, String)>, // (section_id, track_id)
+    pub block_drag: Option<BlockDragState>,
+    pub show_tempo_dialog: Option<(String, Option<String>)>, // (section_id, Option<track_id>)
+    pub tempo_dialog_mode: usize, // 0 = Inherited, 1 = Absolute BPM, 2 = Ratio
+    pub tempo_dialog_bpm: f64,
+    pub tempo_dialog_num: u32,
+    pub tempo_dialog_den: u32,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -285,7 +304,7 @@ impl JamOutApp {
             _status_time: Instant::now(),
             active_tab: Tab::Timeline,
             lyrics,
-            drift_ticks: 20,       // ±20 ticks Gaussian feel
+            _drift_ticks: 20,       // ±20 ticks Gaussian feel
             drag_bias_ticks: 15,   // +15 ticks lazy 90s R&B drag
             freehand_drift: false,
             show_project_dialog: false,
@@ -308,6 +327,13 @@ impl JamOutApp {
             insert_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
             drag_start: None,
+            selected_block: None,
+            block_drag: None,
+            show_tempo_dialog: None,
+            tempo_dialog_mode: 0,
+            tempo_dialog_bpm: 120.0,
+            tempo_dialog_num: 3,
+            tempo_dialog_den: 2,
         }
     }
 
@@ -621,6 +647,114 @@ impl eframe::App for JamOutApp {
 
                         if ui.button("Close").clicked() {
                             self.show_section_dialog = false;
+                        }
+                    });
+                });
+        }
+
+        // Tempo & Metric Modulation Modal
+        if let Some((sec_id, track_id_opt)) = self.show_tempo_dialog.clone() {
+            let is_block = track_id_opt.is_some();
+            let title = if let Some(ref tid) = track_id_opt {
+                format!("⏱ Track Block Tempo ({})", tid)
+            } else {
+                format!("⏱ Section Tempo ({})", sec_id)
+            };
+
+            let project_bpm = self.last_status.as_ref().map(|s| s.bpm).unwrap_or(120.0);
+            let parent_bpm = if is_block {
+                self.last_status
+                    .as_ref()
+                    .and_then(|s| s.sections.iter().find(|sec| sec.id == sec_id))
+                    .map(|sec| sec.effective_bpm(project_bpm))
+                    .unwrap_or(project_bpm)
+            } else {
+                project_bpm
+            };
+
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.label(egui::RichText::new("Hierarchical Tempo Inheritance").strong());
+                    ui.small(format!("Parent Tempo: {:.1} BPM", parent_bpm));
+                    ui.add_space(8.0);
+
+                    ui.radio_value(&mut self.tempo_dialog_mode, 0, "Inherit from parent");
+                    ui.radio_value(&mut self.tempo_dialog_mode, 1, "Absolute BPM");
+                    if self.tempo_dialog_mode == 1 {
+                        ui.indent("abs_bpm_indent", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("BPM:");
+                                ui.add(egui::DragValue::new(&mut self.tempo_dialog_bpm).speed(0.5).range(20.0..=300.0));
+                            });
+                        });
+                    }
+
+                    ui.radio_value(&mut self.tempo_dialog_mode, 2, "Ratio (Metric Modulation)");
+                    if self.tempo_dialog_mode == 2 {
+                        ui.indent("ratio_bpm_indent", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Ratio:");
+                                ui.add(egui::DragValue::new(&mut self.tempo_dialog_num).speed(1).range(1..=16));
+                                ui.label(":");
+                                ui.add(egui::DragValue::new(&mut self.tempo_dialog_den).speed(1).range(1..=16));
+                            });
+                            let eff = if self.tempo_dialog_den > 0 {
+                                parent_bpm * (self.tempo_dialog_num as f64 / self.tempo_dialog_den as f64)
+                            } else {
+                                parent_bpm
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Resulting Tempo: {}:{} ({:.1} BPM)",
+                                    self.tempo_dialog_num, self.tempo_dialog_den, eff
+                                ))
+                                .italics()
+                                .color(egui::Color32::from_rgb(255, 180, 50)),
+                            );
+
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.small_button("3:2 (1.5x)").clicked() { self.tempo_dialog_num = 3; self.tempo_dialog_den = 2; }
+                                if ui.small_button("4:3 (1.33x)").clicked() { self.tempo_dialog_num = 4; self.tempo_dialog_den = 3; }
+                                if ui.small_button("1:2 (0.5x)").clicked() { self.tempo_dialog_num = 1; self.tempo_dialog_den = 2; }
+                                if ui.small_button("2:1 (2.0x)").clicked() { self.tempo_dialog_num = 2; self.tempo_dialog_den = 1; }
+                            });
+                        });
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply Tempo").clicked() {
+                            let override_val = match self.tempo_dialog_mode {
+                                1 => Some(TempoOverride::AbsoluteBpm(self.tempo_dialog_bpm)),
+                                2 => Some(TempoOverride::Ratio(self.tempo_dialog_num, self.tempo_dialog_den)),
+                                _ => None,
+                            };
+
+                            if let Some(ref tid) = track_id_opt {
+                                self.send_cmd(IpcCommand::SetBlockTempo {
+                                    section_id: sec_id.clone(),
+                                    track_id: tid.clone(),
+                                    tempo: override_val,
+                                });
+                                self.status_msg = format!("Updated tempo for block '{}' in section '{}'", tid, sec_id);
+                            } else {
+                                self.send_cmd(IpcCommand::SetSectionTempo {
+                                    section_id: sec_id.clone(),
+                                    tempo: override_val,
+                                });
+                                self.status_msg = format!("Updated tempo for section '{}'", sec_id);
+                            }
+                            self.show_tempo_dialog = None;
+                        }
+
+                        if ui.button("Cancel").clicked() {
+                            self.show_tempo_dialog = None;
                         }
                     });
                 });
@@ -967,360 +1101,545 @@ impl eframe::App for JamOutApp {
 
 impl JamOutApp {
     fn render_timeline_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Arrangement Timeline");
-        ui.add_space(8.0);
-
-        let total_ticks = self.last_status.as_ref().map(|s| s.total_ticks).unwrap_or(15360);
+        let total_ticks = self.last_status.as_ref().map(|s| s.total_ticks).unwrap_or(0);
         let current_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
         let active_section_id = self.last_status.as_ref().and_then(|s| s.active_section_id.clone());
         let sections = self.last_status.as_ref().map(|s| s.sections.clone()).unwrap_or_default();
+        let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
+        let project_bpm = self.last_status.as_ref().map(|s| s.bpm).unwrap_or(120.0);
 
-        // Timeline scrubber & active section indicator
+        // --- 0. KEYBOARD SHORTCUTS FOR SELECTED BLOCK NUDGING ---
+        if let Some((ref sec_id, ref track_id)) = self.selected_block.clone() {
+            let alt_held = ui.input(|i| i.modifiers.alt);
+            if alt_held {
+                let nudge_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+                let nudge_right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
+                if nudge_left || nudge_right {
+                    if let Some(sec) = sections.iter().find(|s| s.id == *sec_id) {
+                        if let Some(block) = sec.track_blocks.get(track_id) {
+                            let mut updated = block.clone();
+                            if nudge_left {
+                                updated.start_offset_ticks = updated.start_offset_ticks.saturating_sub(240);
+                            } else {
+                                updated.start_offset_ticks += 240;
+                            }
+                            self.send_cmd(IpcCommand::SetTrackBlock {
+                                section_id: sec_id.clone(),
+                                block: updated,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 1. TOP HEADER & TRANSPORT TIMELINE ---
         ui.horizontal(|ui| {
+            ui.heading("Arrangement Matrix Arranger");
+            ui.separator();
+            ui.label(egui::RichText::new(format!("Base Tempo: {:.1} BPM", project_bpm)).strong());
+
+            ui.separator();
             ui.label("Playhead:");
             let mut seek_tick = current_tick;
-            if ui.add(egui::Slider::new(&mut seek_tick, 0..=total_ticks).text("Ticks")).changed() {
+            if ui.add(egui::Slider::new(&mut seek_tick, 0..=total_ticks.max(1)).text("Ticks")).changed() {
                 self.send_cmd(IpcCommand::Seek { tick: seek_tick });
             }
 
             if let Some(sec_id) = &active_section_id {
                 ui.separator();
-                ui.colored_label(egui::Color32::from_rgb(255, 215, 0), format!("📍 Section: {}", sec_id));
+                ui.colored_label(egui::Color32::from_rgb(255, 215, 0), format!("📍 Active Section: {}", sec_id));
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("➕ Add Section").on_hover_text("Define or append a new song section").clicked() {
+                    self.new_section_start_tick = total_ticks;
+                    self.show_section_dialog = true;
+                }
+            });
         });
 
         ui.add_space(6.0);
 
-        // --- SECTION MARKER LANE ---
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Song Sections (Orchestration Scope):").small());
-            if ui.button("➕ Add Section").on_hover_text("Define or append a song section with tick precision").clicked() {
-                if let Some(last_sec) = sections.last() {
-                    self.new_section_start_tick = last_sec.end_tick();
-                } else {
-                    self.new_section_start_tick = current_tick;
-                }
-                self.show_section_dialog = true;
-            }
-        });
+        // --- 2. SELECTED BLOCK INSPECTOR & NUDGE TOOLBAR ---
+        if let Some((ref sec_id, ref track_id)) = self.selected_block.clone() {
+            if let Some(sec) = sections.iter().find(|s| s.id == *sec_id) {
+                if let Some(block) = sec.track_blocks.get(track_id) {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("🔍 Selected Block: {} / {}", sec.name, track_id)).strong());
 
-        ui.horizontal_wrapped(|ui| {
-            if sections.is_empty() {
-                ui.small("(No sections defined. Click '➕ Add Section' to create verse, chorus, or pickup sections.)");
-            }
-            for sec in &sections {
-                let is_current = active_section_id.as_deref() == Some(&sec.id);
-                let timing_str = if sec.length_ticks % 3840 == 0 && sec.start_tick % 3840 == 0 {
-                    format!("Bar {}-{}", sec.start_bar, sec.start_bar + sec.bars.max(1) - 1)
-                } else {
-                    let (b, beat) = sec.start_bar_beat();
-                    format!("Bar {}.{}, {}t", b, beat, sec.length_ticks)
-                };
-                let btn_text = format!("{} ({})", sec.name, timing_str);
-                let btn = if is_current {
-                    egui::Button::new(egui::RichText::new(btn_text).strong().color(egui::Color32::BLACK))
-                        .fill(egui::Color32::from_rgb(255, 215, 80))
-                } else {
-                    egui::Button::new(btn_text)
-                        .fill(egui::Color32::from_rgb(50, 60, 75))
-                };
+                            ui.separator();
+                            ui.label("Start Offset:");
+                            let mut offset = block.start_offset_ticks;
+                            let bar = (offset / 3840) + 1;
+                            let beat = ((offset % 3840) as f64 / 960.0) + 1.0;
+                            ui.small(format!("(Bar {}.{:.1})", bar, beat));
+                            if ui.add(egui::DragValue::new(&mut offset).speed(240).range(0..=1000000)).changed() {
+                                let mut updated = block.clone();
+                                updated.start_offset_ticks = offset;
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
+                            }
 
-                if ui.add(btn).clicked() {
-                    // Click section to jump playhead to its downbeat
-                    self.send_cmd(IpcCommand::Seek { tick: sec.start_tick() });
-                }
+                            // Nudge buttons
+                            if ui.small_button("◀ -240t").on_hover_text("Nudge earlier 1/16 note (Alt+Left)").clicked() {
+                                let mut updated = block.clone();
+                                updated.start_offset_ticks = updated.start_offset_ticks.saturating_sub(240);
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
+                            }
+                            if ui.small_button("+240t ▶").on_hover_text("Nudge later 1/16 note (Alt+Right)").clicked() {
+                                let mut updated = block.clone();
+                                updated.start_offset_ticks += 240;
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
+                            }
 
-                if ui.small_button("🗑").on_hover_text(format!("Delete section '{}'", sec.name)).clicked() {
-                    self.send_cmd(IpcCommand::RemoveSection { section_id: sec.id.clone() });
-                    self.status_msg = format!("Removed section '{}'", sec.name);
-                }
+                            ui.separator();
+                            ui.label("Base Length:");
+                            let mut base_len = block.base_length_ticks;
+                            if ui.add(egui::DragValue::new(&mut base_len).speed(240).range(240..=1000000)).changed() {
+                                let mut updated = block.clone();
+                                updated.base_length_ticks = base_len;
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
+                            }
 
-                ui.add_space(4.0);
-            }
-        });
-
-        ui.add_space(8.0);
-
-        // --- HUMAN DRIFT & GROOVE TOOLBAR ---
-        ui.horizontal(|ui| {
-            ui.label("Groove Feel:");
-            ui.checkbox(&mut self.freehand_drift, "Freehand Micro-Timing (Shift-bypass snap)");
-
-            ui.separator();
-            ui.label("Drift:");
-            ui.add(egui::Slider::new(&mut self.drift_ticks, 0..=80).text("±Ticks"));
-
-            ui.separator();
-            ui.label("Drag (Late):");
-            ui.add(egui::Slider::new(&mut self.drag_bias_ticks, -20..=60).text("Ticks"));
-
-            ui.separator();
-            ui.label("Note Length:");
-            let durations = [
-                (240u64, "1/16"),
-                (480u64, "1/8"),
-                (960u64, "1/4"),
-                (1920u64, "1/2"),
-                (3840u64, "1 Bar"),
-            ];
-            for (dur, label) in durations {
-                if ui.selectable_label(self.note_duration_ticks == dur, label).clicked() {
-                    self.note_duration_ticks = dur;
-                }
-            }
-
-            ui.separator();
-            if ui.button("🎲 Humanize Selected Section").clicked() {
-                let sec_id = active_section_id.clone();
-                // Send humanize to all tracks for the current section
-                let tracks_clone = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
-                for t in tracks_clone {
-                    self.send_cmd(IpcCommand::HumanizeTrack {
-                        track_id: t.id.clone(),
-                        section_id: sec_id.clone(),
-                        timing_drift_ticks: self.drift_ticks,
-                        drag_bias_ticks: self.drag_bias_ticks,
-                        velocity_jitter: 0.08,
-                    });
-                }
-                self.status_msg = format!("Humanized active section with ±{} drift and +{} drag", self.drift_ticks, self.drag_bias_ticks);
-            }
-        });
-
-        ui.add_space(8.0);
-
-        // Track Lanes
-        let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
-        let events = self.last_status.as_ref().map(|s| s.events.clone()).unwrap_or_default();
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (idx, track) in tracks.iter().enumerate() {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(48.0);
-                        // Strict fixed-width Track Header (220px) so lanes never get offset by label length
-                        ui.allocate_ui(egui::vec2(220.0, 42.0), |ui| {
-                            ui.set_width(220.0);
-                            ui.set_max_width(220.0);
-                            ui.vertical(|ui| {
-                                let (need_rename, new_name_str) = {
-                                    let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(current_buf)
-                                            .desired_width(210.0)
-                                            .hint_text("Track Name")
-                                    );
-                                    if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
-                                        (true, current_buf.trim().to_string())
-                                    } else {
-                                        (false, String::new())
+                            ui.separator();
+                            ui.label("Loop Mode:");
+                            let mode_label = match block.loop_mode {
+                                LoopMode::OneShot => "One-Shot (1x)",
+                                LoopMode::LoopToSection => "Loop To Section",
+                                LoopMode::FixedLoops(n) => if n == 2 { "Loop 2x" } else { "Loop 4x" },
+                            };
+                            egui::ComboBox::from_id_salt("block_loop_combo")
+                                .selected_text(mode_label)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(block.loop_mode == LoopMode::OneShot, "One-Shot (1x)").clicked() {
+                                        let mut updated = block.clone();
+                                        updated.loop_mode = LoopMode::OneShot;
+                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
                                     }
-                                };
-                                if need_rename {
-                                    self.send_cmd(IpcCommand::RenameTrack {
-                                        track_id: track.id.clone(),
-                                        new_name: new_name_str.clone(),
-                                    });
-                                    self.status_msg = format!("Renamed track to '{}'", new_name_str);
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.small(&format!("ID: {}", track.id));
-                                    if ui.small_button("🎹").on_hover_text("Open Piano Roll").clicked() {
-                                        self.selected_track_id = track.id.clone();
-                                        self.active_tab = Tab::PianoRoll;
+                                    if ui.selectable_label(block.loop_mode == LoopMode::LoopToSection, "Loop To Section").clicked() {
+                                        let mut updated = block.clone();
+                                        updated.loop_mode = LoopMode::LoopToSection;
+                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
                                     }
-                                    if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP Parameters").clicked() {
-                                        if self.edit_track_id.as_deref() != Some(&track.id) {
-                                            self.edit_insert_slot = None;
-                                        }
-                                        self.edit_track_id = Some(track.id.clone());
+                                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(2), "Loop 2x").clicked() {
+                                        let mut updated = block.clone();
+                                        updated.loop_mode = LoopMode::FixedLoops(2);
+                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
                                     }
-                                    if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
-                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
-                                    }
-                                    if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
-                                        self.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
-                                    }
-                                    if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
-                                        self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
-                                        self.status_msg = format!("Deleted track '{}'", track.name);
+                                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(4), "Loop 4x").clicked() {
+                                        let mut updated = block.clone();
+                                        updated.loop_mode = LoopMode::FixedLoops(4);
+                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
                                     }
                                 });
-                            });
+
+                            ui.separator();
+                            if ui.button("⏱ Block Tempo").clicked() {
+                                self.show_tempo_dialog = Some((sec.id.clone(), Some(track_id.clone())));
+                            }
+
+                            if ui.button("🎹 Piano Roll").clicked() {
+                                self.selected_track_id = track_id.clone();
+                                self.active_tab = Tab::PianoRoll;
+                            }
+
+                            if ui.small_button("🗑").on_hover_text("Delete track block").clicked() {
+                                self.send_cmd(IpcCommand::RemoveTrackBlock {
+                                    section_id: sec.id.clone(),
+                                    track_id: track_id.clone(),
+                                });
+                                self.selected_block = None;
+                            }
                         });
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+        }
 
-                        ui.separator();
-
-                        // Interactive Clip/Note Lane Canvas
-                        let lane_width = (ui.available_width() - 40.0).max(100.0);
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(lane_width, 42.0),
-                            egui::Sense::click(),
-                        );
-
-                        // Click to interactively add/delete note at clicked tick!
-                        if response.clicked() {
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                let pct = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                                let clicked_tick = (pct * total_ticks as f32) as u64;
-
-                                // If Shift is held or Freehand is enabled, place with exact micro-timing resolution!
-                                let shift_held = ui.input(|i| i.modifiers.shift);
-                                let final_tick = if shift_held || self.freehand_drift {
-                                    // Exact pixel/tick resolution + drag bias
-                                    (clicked_tick as i64 + self.drag_bias_ticks).max(0) as u64
-                                } else {
-                                    // Snapped to 16th note grid (240 ticks) + subtle drag bias
-                                    let snapped = (clicked_tick / 240) * 240;
-                                    (snapped as i64 + self.drag_bias_ticks).max(0) as u64
-                                };
-
-                                let note_pitch = if idx == 0 { 50 } else { 62 }; // D3 bass, D4 pad
-                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-
-                                // Send granular AddNote command to jamseq
-                                self.send_cmd(IpcCommand::AddNote {
-                                    note_on_id: now_ms,
-                                    note_off_id: now_ms + 1,
-                                    track_id: track.id.clone(),
-                                    tick: final_tick,
-                                    duration_ticks: self.note_duration_ticks,
-                                    note: note_pitch,
-                                    velocity: 0.9,
-                                });
-                                let mode_str = if shift_held || self.freehand_drift { "Freehand micro-timed" } else { "Grid-snapped" };
-                                self.status_msg = format!("{} note on {} at tick {} (length: {} ticks)", mode_str, track.name, final_tick, self.note_duration_ticks);
+        // --- 3. MATRIX ARRANGER GRID (Sections Columns x Tracks Rows) ---
+        egui::ScrollArea::both().show(ui, |ui| {
+            // Header Row: Track Column Header + Each Section Column Header
+            ui.horizontal(|ui| {
+                // Top-Left Corner Cell (Track Column Header)
+                ui.allocate_ui(egui::vec2(220.0, 52.0), |ui| {
+                    ui.set_width(220.0);
+                    ui.set_max_width(220.0);
+                    ui.vertical(|ui| {
+                        ui.strong("TRACKS");
+                        ui.horizontal(|ui| {
+                            if ui.small_button("➕ MIDI").clicked() {
+                                let count = tracks.len() + 1;
+                                let id = format!("track_{}", count);
+                                let name = format!("MIDI Track {}", count);
+                                self.send_cmd(IpcCommand::AddTrack { id: id.clone(), name: name.clone(), track_type: "synth".to_string() });
+                                self.track_name_edits.insert(id, name);
                             }
-                        } else if response.secondary_clicked() {
-                            // Right click deletes note at position
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                let pct = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                                let clicked_tick = (pct * total_ticks as f32) as u64;
-                                let note_pitch = if idx == 0 { 50 } else { 62 };
-                                self.send_cmd(IpcCommand::DeleteNoteAt {
-                                    track_id: track.id.clone(),
-                                    tick: clicked_tick,
-                                    note: note_pitch,
-                                    });
-                                self.status_msg = format!("Deleted note on {} near tick {}", track.name, clicked_tick);
+                            if ui.small_button("➕ Audio").clicked() {
+                                let count = tracks.len() + 1;
+                                let id = format!("audio_{}", count);
+                                let name = format!("Audio Track {}", count);
+                                self.send_cmd(IpcCommand::AddTrack { id: id.clone(), name: name.clone(), track_type: "audio".to_string() });
+                                self.track_name_edits.insert(id, name);
                             }
-                        }
-
-                        let painter = ui.painter();
-                        let bg_color = if idx == 0 {
-                            egui::Color32::from_rgb(30, 45, 65) // Dark Bass
-                        } else if idx == 1 {
-                            egui::Color32::from_rgb(45, 30, 60) // Dark Pad
-                        } else {
-                            egui::Color32::from_rgb(35, 55, 45)  // Dark Vocals / Audio
-                        };
-
-                        painter.rect_filled(rect, 4.0, bg_color);
-
-                        // Draw subtle grid subdivisions (bars)
-                        let num_bars = (total_ticks / (4 * 960)).max(1) as usize;
-                        for bar in 1..=num_bars {
-                            let bar_pct = (bar as f32 - 1.0) / num_bars as f32;
-                            let bar_x = rect.left() + rect.width() * bar_pct;
-                            painter.line_segment(
-                                [egui::pos2(bar_x, rect.top()), egui::pos2(bar_x, rect.bottom())],
-                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
-                            );
-                        }
-
-                        // --- DRAW ACTUAL TRUE DURATION NOTE BLOCKS ON TRACK LANE ---
-                        let track_events: Vec<&jamseq::ScheduledEvent> = events
-                            .iter()
-                            .filter(|e| e.track_id == track.id)
-                            .collect();
-
-                        for ev in &track_events {
-                            if let jamseq::timeline::ScheduledAction::NoteOn { note, velocity: _ } = ev.action {
-                                if total_ticks > 0 {
-                                    // Calculate true duration by finding the matching NoteOff event
-                                    let note_off_tick = track_events
-                                        .iter()
-                                        .find(|off_ev| {
-                                            off_ev.tick > ev.tick
-                                                && match off_ev.action {
-                                                    jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                    _ => false,
-                                                }
-                                        })
-                                        .map(|off_ev| off_ev.tick)
-                                        .unwrap_or(ev.tick + self.note_duration_ticks);
-
-                                    let duration = note_off_tick.saturating_sub(ev.tick).max(60);
-
-                                    let note_pct = (ev.tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                                    let note_x = rect.left() + rect.width() * note_pct;
-                                    let note_w = (rect.width() * (duration as f32 / total_ticks as f32)).max(4.0);
-                                    let note_rect = egui::Rect::from_min_size(
-                                        egui::pos2(note_x, rect.top() + 6.0),
-                                        egui::vec2(note_w, rect.height() - 12.0),
-                                    );
-                                    let note_color = if idx == 0 {
-                                        egui::Color32::from_rgb(80, 160, 240) // Cyan/Blue 808
-                                    } else if idx == 1 {
-                                        egui::Color32::from_rgb(180, 120, 240) // Lavender Pad
-                                    } else {
-                                        egui::Color32::from_rgb(120, 220, 140) // Green
-                                    };
-                                    painter.rect_filled(note_rect, 2.0, note_color);
-                                }
-                            }
-                        }
-
-                        // Draw playhead cursor across lane
-                        if total_ticks > 0 {
-                            let playhead_pct = (current_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                            let playhead_x = rect.left() + rect.width() * playhead_pct;
-                            painter.line_segment(
-                                [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
-                                egui::Stroke::new(2.5, egui::Color32::WHITE),
-                            );
-                        }
-
-                        // Mute button
-                        let mut muted = track.muted;
-                        if ui.toggle_value(&mut muted, "M").clicked() {
-                            self.send_cmd(IpcCommand::SetMute {
-                                track_id: track.id.clone(),
-                                muted,
-                            });
-                        }
+                        });
                     });
                 });
-                ui.add_space(4.0);
-            }
 
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("➕ MIDI Track").clicked() {
-                    let count = tracks.len() + 1;
-                    let id = format!("midi_{}", count);
-                    let name = format!("MIDI Track {}", count);
-                    self.send_cmd(IpcCommand::AddTrack {
-                        id: id.clone(),
-                        name: name.clone(),
-                        track_type: "synth".to_string(),
-                    });
-                    self.track_name_edits.insert(id, name.clone());
-                    self.status_msg = format!("Created {}", name);
+                ui.separator();
+
+                // Section Column Headers
+                if sections.is_empty() {
+                    ui.label("(No sections in project. Click '➕ Add Section' to create your first arrangement section.)");
                 }
-                if ui.button("➕ Audio Track").clicked() {
-                    let count = tracks.len() + 1;
-                    let id = format!("audio_{}", count);
-                    let name = format!("Audio Track {}", count);
-                    self.send_cmd(IpcCommand::AddTrack {
-                        id: id.clone(),
-                        name: name.clone(),
-                        track_type: "audio".to_string(),
+
+                let mut accum_ticks = 0u64;
+                for (_s_idx, sec) in sections.iter().enumerate() {
+                    let sec_len = sec.length_ticks();
+                    let sec_start_tick = accum_ticks;
+                    accum_ticks += sec_len;
+
+                    let col_width = if sec_len == 0 {
+                        160.0
+                    } else {
+                        ((sec_len as f32 / 3840.0) * 160.0).clamp(180.0, 720.0)
+                    };
+
+                    ui.allocate_ui(egui::vec2(col_width, 52.0), |ui| {
+                        ui.set_width(col_width);
+                        ui.vertical(|ui| {
+                            // Section Name and Energy
+                            ui.horizontal(|ui| {
+                                let is_active = active_section_id.as_deref() == Some(&sec.id);
+                                let sec_btn = if is_active {
+                                    egui::Button::new(egui::RichText::new(format!("▶ {}", sec.name)).strong().color(egui::Color32::BLACK))
+                                        .fill(egui::Color32::from_rgb(255, 215, 80))
+                                } else {
+                                    egui::Button::new(egui::RichText::new(&sec.name).strong())
+                                        .fill(egui::Color32::from_rgb(45, 55, 70))
+                                };
+
+                                if ui.add(sec_btn).on_hover_text("Click to seek playhead to section downbeat").clicked() {
+                                    self.send_cmd(IpcCommand::Seek { tick: sec_start_tick });
+                                }
+
+                                ui.small(format!("⚡{}", sec.energy));
+
+                                if ui.small_button("🗑").on_hover_text("Delete section").clicked() {
+                                    self.send_cmd(IpcCommand::RemoveSection { section_id: sec.id.clone() });
+                                }
+                            });
+
+                            // Metric Modulation & Length Sub-row
+                            ui.horizontal(|ui| {
+                                // Metric Modulation Tempo Pill
+                                let eff_bpm = sec.effective_bpm(project_bpm);
+                                let tempo_text = match sec.tempo {
+                                    Some(TempoOverride::AbsoluteBpm(b)) => format!("{:.1} BPM", b),
+                                    Some(TempoOverride::Ratio(n, d)) => format!("{}:{} ({:.1} BPM)", n, d, eff_bpm),
+                                    None => format!("{:.1} BPM [Inherit]", eff_bpm),
+                                };
+
+                                let pill_color = match sec.tempo {
+                                    Some(TempoOverride::Ratio(_, _)) => egui::Color32::from_rgb(180, 100, 30),
+                                    Some(TempoOverride::AbsoluteBpm(_)) => egui::Color32::from_rgb(30, 90, 160),
+                                    None => egui::Color32::from_rgb(60, 65, 75),
+                                };
+
+                                if ui.add(egui::Button::new(egui::RichText::new(tempo_text).small()).fill(pill_color))
+                                    .on_hover_text("Click to configure section tempo or metric modulation")
+                                    .clicked()
+                                {
+                                    self.show_tempo_dialog = Some((sec.id.clone(), None));
+                                }
+
+                                // Derived Length Display
+                                if sec_len == 0 {
+                                    ui.small(egui::RichText::new("(Empty - 0t)").color(egui::Color32::GRAY));
+                                } else {
+                                    let bars = sec_len as f64 / 3840.0;
+                                    ui.small(format!("{:.1}b ({}t)", bars, sec_len));
+                                }
+                            });
+                        });
                     });
-                    self.track_name_edits.insert(id, name.clone());
-                    self.status_msg = format!("Created {}", name);
+
+                    ui.separator();
                 }
+
+                // Placeholder button column to append section
+                ui.allocate_ui(egui::vec2(120.0, 52.0), |ui| {
+                    ui.set_width(120.0);
+                    if ui.button("➕ New Section").clicked() {
+                        self.new_section_start_tick = total_ticks;
+                        self.show_section_dialog = true;
+                    }
+                });
             });
+
+            ui.separator();
+
+            // Track Rows: Each Track intersects all Sections
+            for (t_idx, track) in tracks.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(64.0);
+
+                    // Track Control Header (Leftmost 220px)
+                    ui.allocate_ui(egui::vec2(220.0, 64.0), |ui| {
+                        ui.set_width(220.0);
+                        ui.set_max_width(220.0);
+                        ui.vertical(|ui| {
+                            let (need_rename, new_name_str) = {
+                                let current_buf = self.track_name_edits.entry(track.id.clone()).or_insert_with(|| track.name.clone());
+                                let resp = ui.add(egui::TextEdit::singleline(current_buf).desired_width(210.0));
+                                if resp.lost_focus() && *current_buf != track.name && !current_buf.trim().is_empty() {
+                                    (true, current_buf.trim().to_string())
+                                } else {
+                                    (false, String::new())
+                                }
+                            };
+                            if need_rename {
+                                self.send_cmd(IpcCommand::RenameTrack { track_id: track.id.clone(), new_name: new_name_str.clone() });
+                                self.status_msg = format!("Renamed track to '{}'", new_name_str);
+                            }
+
+                            ui.horizontal(|ui| {
+                                ui.small(if track.current_bpm > 0.0 { format!("{:.1} BPM", track.current_bpm) } else { format!("{:.1} BPM", project_bpm) });
+
+                                if ui.small_button("🎹").on_hover_text("Open Piano Roll").clicked() {
+                                    self.selected_track_id = track.id.clone();
+                                    self.active_tab = Tab::PianoRoll;
+                                }
+                                if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP").clicked() {
+                                    self.edit_track_id = Some(track.id.clone());
+                                }
+
+                                let mut muted = track.muted;
+                                if ui.toggle_value(&mut muted, "M").clicked() {
+                                    self.send_cmd(IpcCommand::SetMute { track_id: track.id.clone(), muted });
+                                }
+
+                                let mut solo = track.solo;
+                                if ui.toggle_value(&mut solo, "S").clicked() {
+                                    self.send_cmd(IpcCommand::SetSolo { track_id: track.id.clone(), solo });
+                                }
+
+                                if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
+                                    self.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
+                                }
+                            });
+                        });
+                    });
+
+                    ui.separator();
+
+                    // Section Cells for this Track
+                    let mut cell_accum_ticks = 0u64;
+                    for (_s_idx, sec) in sections.iter().enumerate() {
+                        let sec_len = sec.length_ticks();
+                        let sec_start_tick = cell_accum_ticks;
+                        cell_accum_ticks += sec_len;
+
+                        let col_width = if sec_len == 0 {
+                            160.0
+                        } else {
+                            ((sec_len as f32 / 3840.0) * 160.0).clamp(180.0, 720.0)
+                        };
+
+                        let (cell_rect, cell_resp) = ui.allocate_exact_size(
+                            egui::vec2(col_width, 64.0),
+                            egui::Sense::click_and_drag(),
+                        );
+
+                        // Background grid lines and cell canvas
+                        ui.painter().rect_filled(
+                            cell_rect,
+                            2.0,
+                            egui::Color32::from_rgb(25, 28, 35),
+                        );
+
+                        // If track has a block inside this section:
+                        if let Some(block) = sec.track_blocks.get(&track.id) {
+                            let is_selected = self.selected_block.as_ref() == Some(&(sec.id.clone(), track.id.clone()));
+
+                            // REAPER-style horizontal item positioning within cell
+                            let block_rect = if sec_len > 0 {
+                                let s_ratio = (block.start_offset_ticks as f32 / sec_len as f32).clamp(0.0, 1.0);
+                                let l_ratio = (block.effective_length_ticks() as f32 / sec_len as f32).clamp(0.05, 1.0);
+                                let bx = cell_rect.left() + s_ratio * cell_rect.width();
+                                let bw = (l_ratio * cell_rect.width()).max(60.0).min(cell_rect.right() - bx);
+                                egui::Rect::from_min_size(egui::pos2(bx, cell_rect.top() + 4.0), egui::vec2(bw, cell_rect.height() - 8.0))
+                            } else {
+                                egui::Rect::from_min_size(egui::pos2(cell_rect.left() + 4.0, cell_rect.top() + 4.0), egui::vec2(cell_rect.width() - 8.0, cell_rect.height() - 8.0))
+                            };
+
+                            let card_color = if t_idx % 3 == 0 {
+                                egui::Color32::from_rgb(35, 65, 95) // Cyan/Navy Synth
+                            } else if t_idx % 3 == 1 {
+                                egui::Color32::from_rgb(75, 45, 90) // Purple Lead
+                            } else {
+                                egui::Color32::from_rgb(45, 80, 55) // Green Drums
+                            };
+
+                            let stroke = if is_selected {
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 215, 0))
+                            } else {
+                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60))
+                            };
+
+                            let painter = ui.painter();
+                            painter.rect(block_rect, 4.0, card_color, stroke);
+
+                            // Block title & offset readout
+                            let title_text = if block.start_offset_ticks > 0 {
+                                format!("{} (+{}t)", block.id, block.start_offset_ticks)
+                            } else {
+                                block.id.clone()
+                            };
+                            painter.text(
+                                egui::pos2(block_rect.left() + 6.0, block_rect.top() + 4.0),
+                                egui::Align2::LEFT_TOP,
+                                title_text,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+
+                            // Loop Mode & Metric Modulation Badges
+                            let mode_pill = match block.loop_mode {
+                                LoopMode::OneShot => "1x",
+                                LoopMode::LoopToSection => "Loop",
+                                LoopMode::FixedLoops(n) => if n == 2 { "2x" } else { "4x" },
+                            };
+                            painter.text(
+                                egui::pos2(block_rect.right() - 6.0, block_rect.top() + 4.0),
+                                egui::Align2::RIGHT_TOP,
+                                mode_pill,
+                                egui::FontId::monospace(10.0),
+                                egui::Color32::from_rgb(200, 220, 255),
+                            );
+
+                            if let Some(t_override) = block.tempo {
+                                let badge_str = match t_override {
+                                    TempoOverride::Ratio(n, d) => format!("{}:{}", n, d),
+                                    TempoOverride::AbsoluteBpm(b) => format!("{:.0}BPM", b),
+                                };
+                                painter.text(
+                                    egui::pos2(block_rect.left() + 6.0, block_rect.bottom() - 14.0),
+                                    egui::Align2::LEFT_TOP,
+                                    badge_str,
+                                    egui::FontId::monospace(10.0),
+                                    egui::Color32::from_rgb(255, 180, 50),
+                                );
+                            }
+
+                            // Miniature Note Previews
+                            for ev in &block.events {
+                                if let jamseq::timeline::ScheduledAction::NoteOn { .. } = ev.action {
+                                    let ev_pct = (ev.tick as f32 / block.base_length_ticks.max(1) as f32).clamp(0.0, 1.0);
+                                    let nx = block_rect.left() + ev_pct * block_rect.width();
+                                    painter.line_segment(
+                                        [egui::pos2(nx, block_rect.top() + 18.0), egui::pos2(nx, block_rect.bottom() - 6.0)],
+                                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180)),
+                                    );
+                                }
+                            }
+
+                            // --- INTERACTIVE DRAGGING: ITEM SLIDING & SLIP EDITING ---
+                            if cell_resp.clicked() {
+                                self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                            }
+
+                            if cell_resp.drag_started() {
+                                self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                                let is_slip = ui.input(|i| i.modifiers.alt);
+                                let start_pos = cell_resp.interact_pointer_pos().map(|p| p.x).unwrap_or(0.0);
+                                self.block_drag = Some(BlockDragState {
+                                    section_id: sec.id.clone(),
+                                    track_id: track.id.clone(),
+                                    initial_offset: block.start_offset_ticks,
+                                    start_pos_x: start_pos,
+                                    is_slip_edit: is_slip,
+                                });
+                            }
+
+                            if cell_resp.dragged() {
+                                if let Some(ref drag) = self.block_drag.clone() {
+                                    if drag.section_id == sec.id && drag.track_id == track.id {
+                                        if let Some(pos) = cell_resp.interact_pointer_pos() {
+                                            let delta_px = pos.x - drag.start_pos_x;
+                                            let ticks_per_px = if sec_len > 0 { sec_len as f32 / cell_rect.width() } else { 3840.0 / cell_rect.width() };
+                                            let delta_ticks = (delta_px * ticks_per_px) as i64;
+
+                                            let shift_held = ui.input(|i| i.modifiers.shift);
+                                            let snapped_delta = if shift_held || self.freehand_drift {
+                                                delta_ticks
+                                            } else {
+                                                (delta_ticks / 240) * 240
+                                            };
+
+                                            if drag.is_slip_edit {
+                                                // Slip Editing: Shift internal event timestamps
+                                                let mut updated = block.clone();
+                                                for ev in &mut updated.events {
+                                                    ev.tick = (ev.tick as i64 + snapped_delta).max(0) as u64;
+                                                }
+                                                self.send_cmd(IpcCommand::SetTrackBlock {
+                                                    section_id: sec.id.clone(),
+                                                    block: updated,
+                                                });
+                                            } else {
+                                                // Horizontal Item Sliding: Shift start_offset_ticks
+                                                let new_offset = (drag.initial_offset as i64 + snapped_delta).max(0) as u64;
+                                                let mut updated = block.clone();
+                                                updated.start_offset_ticks = new_offset;
+                                                self.send_cmd(IpcCommand::SetTrackBlock {
+                                                    section_id: sec.id.clone(),
+                                                    block: updated,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if cell_resp.drag_stopped() {
+                                self.block_drag = None;
+                            }
+                        } else {
+                            // Empty / Rest Cell (Silence for this track in this section)
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_rect), |ui| {
+                                ui.centered_and_justified(|ui| {
+                                    if ui.small_button("➕ Add Block").on_hover_text("Add a track block / pattern to this section").clicked() {
+                                        let block_id = format!("{}_{}", sec.id, track.id);
+                                        let new_block = TrackBlock::new(&block_id, &track.id, 3840);
+                                        self.send_cmd(IpcCommand::SetTrackBlock {
+                                            section_id: sec.id.clone(),
+                                            block: new_block,
+                                        });
+                                        self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                                    }
+                                });
+                            });
+                        }
+
+                        // Playhead drawing across cell
+                        if current_tick >= sec_start_tick && current_tick < sec_start_tick + sec_len && sec_len > 0 {
+                            let rel_tick = current_tick - sec_start_tick;
+                            let p_pct = (rel_tick as f32 / sec_len as f32).clamp(0.0, 1.0);
+                            let px = cell_rect.left() + p_pct * cell_rect.width();
+                            ui.painter().line_segment(
+                                [egui::pos2(px, cell_rect.top()), egui::pos2(px, cell_rect.bottom())],
+                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                            );
+                        }
+
+                        ui.separator();
+                    }
+                });
+
+                ui.add_space(2.0);
+            }
         });
     }
 
