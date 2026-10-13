@@ -79,15 +79,32 @@ impl SearchablePicker {
         items: &'a [T],
         label_fn: impl Fn(&T) -> String,
     ) -> Option<&'a T> {
+        let popup_id = ui.make_persistent_id(id_salt);
+        let button_text = format!("{} ⏷", selected_text);
+        let btn_resp = ui.button(button_text);
+        let was_opened = btn_resp.clicked();
+        if was_opened {
+            ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+        }
+
         let mut selected = None;
-        egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
+
+        egui::popup_above_or_below_widget(
+            ui,
+            popup_id,
+            &btn_resp,
+            egui::AboveOrBelow::Below,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(220.0);
                 ui.horizontal(|ui| {
                     let edit = TextEdit::singleline(filter)
                         .hint_text("🔍 Filter...")
                         .desired_width(180.0);
                     let resp = ui.add(edit);
+                    if was_opened {
+                        resp.request_focus();
+                    }
                     if !filter.is_empty() && ui.button("✖").clicked() {
                         filter.clear();
                         resp.request_focus();
@@ -119,11 +136,14 @@ impl SearchablePicker {
                                 let is_selected = selected_text == label;
                                 if ui.selectable_label(is_selected, &label).clicked() {
                                     selected = Some(item);
+                                    ui.memory_mut(|mem| mem.close_popup());
                                 }
                             }
                         });
                 }
-            });
+            },
+        );
+
         selected
     }
 }
