@@ -2980,6 +2980,19 @@ impl JamOutApp {
                     egui::Sense::click(),
                 );
 
+                let hovered_pitch = ui.input(|i| i.pointer.hover_pos()).and_then(|pos| {
+                    if pos.y >= key_rect.top() && pos.y < key_rect.top() + num_notes as f32 * row_height {
+                        let row_idx = ((pos.y - key_rect.top()) / row_height).floor() as u8;
+                        if (row_idx as usize) < num_notes {
+                            Some(max_note.saturating_sub(row_idx))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+
                 if key_resp.clicked() {
                     if let Some(pos) = key_resp.interact_pointer_pos() {
                         let row_idx = ((pos.y - key_rect.top()) / row_height).floor() as u8;
@@ -2999,9 +3012,12 @@ impl JamOutApp {
                     let is_c = pitch % 12 == 0;
                     let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
                     let is_active_pitch = pitch == self.piano_roll_note_pitch;
+                    let is_hovered = hovered_pitch == Some(pitch);
 
                     let key_bg = if is_active_pitch {
                         egui::Color32::from_rgb(65, 130, 220)
+                    } else if is_hovered {
+                        if is_black { egui::Color32::from_rgb(50, 58, 75) } else { egui::Color32::from_rgb(255, 255, 190) }
                     } else if is_c {
                         egui::Color32::from_rgb(240, 240, 252)
                     } else if is_black {
@@ -3022,6 +3038,8 @@ impl JamOutApp {
                     let oct = (pitch / 12) as i32 - 1;
                     let text_color = if is_active_pitch {
                         egui::Color32::WHITE
+                    } else if is_hovered {
+                        if is_black { egui::Color32::WHITE } else { egui::Color32::from_rgb(20, 20, 50) }
                     } else if is_black {
                         egui::Color32::LIGHT_GRAY
                     } else if is_c {
@@ -3373,8 +3391,24 @@ impl JamOutApp {
                     let r = egui::Rect::from_min_size(egui::pos2(grid_rect.left(), y), egui::vec2(grid_width, row_height));
                     let is_c = pitch % 12 == 0;
                     let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
-                    let row_bg = if is_black { egui::Color32::from_rgb(22, 22, 28) } else { egui::Color32::from_rgb(32, 32, 38) };
+                    let is_hovered = hovered_pitch == Some(pitch);
+
+                    let row_bg = if is_hovered {
+                        if is_black { egui::Color32::from_rgb(36, 40, 52) } else { egui::Color32::from_rgb(46, 52, 66) }
+                    } else if is_black {
+                        egui::Color32::from_rgb(22, 22, 28)
+                    } else {
+                        egui::Color32::from_rgb(32, 32, 38)
+                    };
                     grid_painter.rect_filled(r, 0.0, row_bg);
+
+                    if is_hovered {
+                        grid_painter.rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 160, 255, 60)),
+                        );
+                    }
 
                     if is_c {
                         grid_painter.line_segment(
