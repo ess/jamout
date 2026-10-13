@@ -3,7 +3,7 @@ mod sliding_panel;
 
 use eframe::egui;
 use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse};
-use jamseq::timeline::{LoopMode, TempoOverride, TrackBlock};
+use jamseq::timeline::{LoopMode, TempoOverride, TimeSignature, TrackBlock};
 use search_input::{SearchInput, SearchablePicker};
 use sliding_panel::SlidingPanelStack;
 use std::collections::HashMap;
@@ -95,6 +95,12 @@ struct JamOutApp {
     pub tempo_dialog_bpm: f64,
     pub tempo_dialog_num: u32,
     pub tempo_dialog_den: u32,
+
+    // Cascading Meter & Polymeter State
+    pub show_meter_dialog: Option<(Option<String>, Option<String>)>, // (Option<section_id>, Option<track_id>)
+    pub meter_dialog_inherit: bool,
+    pub meter_dialog_num: u32,
+    pub meter_dialog_den: u32,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -330,6 +336,10 @@ impl JamOutApp {
             tempo_dialog_bpm: 120.0,
             tempo_dialog_num: 3,
             tempo_dialog_den: 2,
+            show_meter_dialog: None,
+            meter_dialog_inherit: true,
+            meter_dialog_num: 4,
+            meter_dialog_den: 4,
         }
     }
 
@@ -506,16 +516,34 @@ impl eframe::App for JamOutApp {
                 ui.separator();
 
                 // Tempo, Time Signature, and Bar/Beat display
-                let current_bar = (current_tick / (4 * 960)) + 1;
-                let current_beat = ((current_tick % (4 * 960)) / 960) + 1;
-                let active_meter = self.last_status.as_ref()
+                let project_ts = self.last_status.as_ref().map(|s| s.time_signature).unwrap_or_default();
+                let active_ts = self.last_status.as_ref()
                     .and_then(|s| {
                         let cur_id = s.active_section_id.as_deref();
                         s.sections.iter().find(|sec| cur_id == Some(&sec.id))
-                            .map(|sec| format!("{}/{}", sec.time_signature.numerator, sec.time_signature.denominator))
+                            .and_then(|sec| sec.time_signature)
                     })
-                    .unwrap_or_else(|| "4/4".to_string());
-                ui.monospace(format!("Bar {:02} : {:02} | {} | {:.1} BPM", current_bar, current_beat, active_meter, bpm));
+                    .unwrap_or(project_ts);
+
+                let ticks_per_bar = active_ts.ticks_per_bar().max(1);
+                let ticks_per_beat = active_ts.ticks_per_beat().max(1);
+                let current_bar = (current_tick / ticks_per_bar) + 1;
+                let current_beat = ((current_tick % ticks_per_bar) / ticks_per_beat) + 1;
+                let active_meter_str = format!("{}/{}", active_ts.numerator, active_ts.denominator);
+
+                ui.monospace(format!("Bar {:02} : {:02}", current_bar, current_beat));
+                ui.separator();
+                if ui.button(egui::RichText::new(format!("📏 {}", active_meter_str)).strong())
+                    .on_hover_text("Click to configure master project time signature")
+                    .clicked()
+                {
+                    self.show_meter_dialog = Some((None, None));
+                    self.meter_dialog_inherit = false;
+                    self.meter_dialog_num = project_ts.numerator;
+                    self.meter_dialog_den = project_ts.denominator;
+                }
+                ui.separator();
+                ui.monospace(format!("{:.1} BPM", bpm));
 
                 ui.separator();
 
@@ -789,6 +817,147 @@ impl eframe::App for JamOutApp {
 
                         if ui.button("Cancel").clicked() {
                             self.show_tempo_dialog = None;
+                        }
+                    });
+                });
+        }
+
+        // Meter & Polymeter Hierarchy Modal
+        if let Some((sec_id_opt, track_id_opt)) = self.show_meter_dialog.clone() {
+            let project_ts = self.last_status.as_ref().map(|s| s.time_signature).unwrap_or_default();
+            let is_block = track_id_opt.is_some();
+            let is_section = sec_id_opt.is_some() && track_id_opt.is_none();
+            let is_project = sec_id_opt.is_none();
+
+            let title = if let Some(ref tid) = track_id_opt {
+                format!("📏 Track Block Meter / Polymeter ({})", tid)
+            } else if let Some(ref sid) = sec_id_opt {
+                format!("📏 Section Time Signature ({})", sid)
+            } else {
+                "📏 Master Project Time Signature".to_string()
+            };
+
+            let parent_ts = if let Some(ref sid) = sec_id_opt {
+                if is_block {
+                    self.last_status.as_ref()
+                        .and_then(|s| s.sections.iter().find(|sec| &sec.id == sid))
+                        .and_then(|sec| sec.time_signature)
+                        .unwrap_or(project_ts)
+                } else {
+                    project_ts
+                }
+            } else {
+                project_ts
+            };
+
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_width(380.0);
+
+                    if is_project {
+                        ui.label(egui::RichText::new("Default Arrangement Time Signature").strong());
+                        ui.small("Controls the global bar and beat grid across all sections unless overridden.");
+                    } else if is_section {
+                        ui.label(egui::RichText::new("Hierarchical Section Meter").strong());
+                        ui.small(format!("Master Project Meter: {}/{}", project_ts.numerator, project_ts.denominator));
+                    } else {
+                        ui.label(egui::RichText::new("Independent Block Polymeter").strong());
+                        ui.colored_label(egui::Color32::from_rgb(220, 150, 255), "⚡ Polymetric phrasing: This block runs independently on its own metric grid.");
+                        ui.small(format!("Parent Section Meter: {}/{}", parent_ts.numerator, parent_ts.denominator));
+                    }
+                    ui.add_space(8.0);
+
+                    if !is_project {
+                        let inherit_label = if is_block {
+                            format!("Inherit from Section ({}/{})", parent_ts.numerator, parent_ts.denominator)
+                        } else {
+                            format!("Inherit from Project ({}/{})", project_ts.numerator, project_ts.denominator)
+                        };
+                        ui.radio_value(&mut self.meter_dialog_inherit, true, inherit_label);
+                        ui.radio_value(&mut self.meter_dialog_inherit, false, if is_block { "Override (Polymeter)" } else { "Override Time Signature" });
+                    }
+
+                    if is_project || !self.meter_dialog_inherit {
+                        ui.indent("meter_custom_indent", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Meter:");
+                                ui.add(egui::DragValue::new(&mut self.meter_dialog_num).speed(1).range(1..=32));
+                                ui.label("/");
+                                egui::ComboBox::from_id_salt("meter_den_combo")
+                                    .selected_text(format!("{}", self.meter_dialog_den))
+                                    .show_ui(ui, |ui| {
+                                        for den in [1, 2, 4, 8, 16, 32] {
+                                            ui.selectable_value(&mut self.meter_dialog_den, den, format!("{}", den));
+                                        }
+                                    });
+                            });
+
+                            let preview_ts = TimeSignature::new(self.meter_dialog_num, self.meter_dialog_den);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Resulting Grid: {}/{} (Bar: {} ticks, Beat: {} ticks)",
+                                    preview_ts.numerator, preview_ts.denominator, preview_ts.ticks_per_bar(), preview_ts.ticks_per_beat()
+                                ))
+                                .italics()
+                                .color(egui::Color32::from_rgb(180, 215, 255)),
+                            );
+
+                            ui.label("Common Presets:");
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.small_button("4/4").clicked() { self.meter_dialog_num = 4; self.meter_dialog_den = 4; }
+                                if ui.small_button("3/4").clicked() { self.meter_dialog_num = 3; self.meter_dialog_den = 4; }
+                                if ui.small_button("2/4").clicked() { self.meter_dialog_num = 2; self.meter_dialog_den = 4; }
+                                if ui.small_button("6/8").clicked() { self.meter_dialog_num = 6; self.meter_dialog_den = 8; }
+                                if ui.small_button("5/4").clicked() { self.meter_dialog_num = 5; self.meter_dialog_den = 4; }
+                                if ui.small_button("7/8").clicked() { self.meter_dialog_num = 7; self.meter_dialog_den = 8; }
+                                if ui.small_button("9/8").clicked() { self.meter_dialog_num = 9; self.meter_dialog_den = 8; }
+                                if ui.small_button("12/8").clicked() { self.meter_dialog_num = 12; self.meter_dialog_den = 8; }
+                            });
+                        });
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply Meter").clicked() {
+                            let override_ts = if is_project || !self.meter_dialog_inherit {
+                                Some(TimeSignature::new(self.meter_dialog_num, self.meter_dialog_den))
+                            } else {
+                                None
+                            };
+
+                            if let Some(ref tid) = track_id_opt {
+                                let sid = sec_id_opt.clone().unwrap_or_default();
+                                self.send_cmd(IpcCommand::SetBlockTimeSignature {
+                                    section_id: sid.clone(),
+                                    track_id: tid.clone(),
+                                    time_signature: override_ts,
+                                });
+                                self.status_msg = format!("Updated meter for block '{}' in section '{}'", tid, sid);
+                            } else if let Some(ref sid) = sec_id_opt {
+                                self.send_cmd(IpcCommand::SetSectionTimeSignature {
+                                    section_id: sid.clone(),
+                                    time_signature: override_ts,
+                                });
+                                self.status_msg = format!("Updated meter for section '{}'", sid);
+                            } else {
+                                if let Some(ts) = override_ts {
+                                    self.send_cmd(IpcCommand::SetProjectTimeSignature {
+                                        numerator: ts.numerator,
+                                        denominator: ts.denominator,
+                                    });
+                                    self.status_msg = format!("Updated project time signature to {}/{}", ts.numerator, ts.denominator);
+                                }
+                            }
+                            self.show_meter_dialog = None;
+                        }
+
+                        if ui.button("Cancel").clicked() {
+                            self.show_meter_dialog = None;
                         }
                     });
                 });
@@ -1141,6 +1310,7 @@ impl JamOutApp {
         let sections = self.last_status.as_ref().map(|s| s.sections.clone()).unwrap_or_default();
         let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
         let project_bpm = self.last_status.as_ref().map(|s| s.bpm).unwrap_or(120.0);
+        let project_ts = self.last_status.as_ref().map(|s| s.time_signature).unwrap_or_default();
 
         // --- 0. KEYBOARD SHORTCUTS FOR SELECTED BLOCK NUDGING ---
         if let Some((ref sec_id, ref track_id)) = self.selected_block.clone() {
@@ -1272,6 +1442,20 @@ impl JamOutApp {
                                 self.show_tempo_dialog = Some((sec.id.clone(), Some(track_id.clone())));
                             }
 
+                            if ui.button("📏 Block Meter").clicked() {
+                                self.show_meter_dialog = Some((Some(sec.id.clone()), Some(track_id.clone())));
+                                if let Some(ts) = block.time_signature {
+                                    self.meter_dialog_inherit = false;
+                                    self.meter_dialog_num = ts.numerator;
+                                    self.meter_dialog_den = ts.denominator;
+                                } else {
+                                    self.meter_dialog_inherit = true;
+                                    let parent_ts = sec.time_signature.unwrap_or(project_ts);
+                                    self.meter_dialog_num = parent_ts.numerator;
+                                    self.meter_dialog_den = parent_ts.denominator;
+                                }
+                            }
+
                             if ui.button("🎹 Piano Roll").clicked() {
                                 self.selected_track_id = track_id.clone();
                                 self.active_tab = Tab::PianoRoll;
@@ -1385,11 +1569,40 @@ impl JamOutApp {
                                     self.show_tempo_dialog = Some((sec.id.clone(), None));
                                 }
 
+                                // Meter Pill
+                                let sec_ts_override = sec.time_signature;
+                                let sec_eff_ts = sec_ts_override.unwrap_or(project_ts);
+                                let meter_text = match sec_ts_override {
+                                    Some(ts) => format!("{}/{}", ts.numerator, ts.denominator),
+                                    None => format!("{}/{} [Inherit]", sec_eff_ts.numerator, sec_eff_ts.denominator),
+                                };
+                                let meter_pill_color = if sec_ts_override.is_some() {
+                                    egui::Color32::from_rgb(130, 50, 160)
+                                } else {
+                                    egui::Color32::from_rgb(50, 55, 68)
+                                };
+                                if ui.add(egui::Button::new(egui::RichText::new(meter_text).small()).fill(meter_pill_color))
+                                    .on_hover_text("Click to configure section time signature")
+                                    .clicked()
+                                {
+                                    self.show_meter_dialog = Some((Some(sec.id.clone()), None));
+                                    if let Some(ts) = sec.time_signature {
+                                        self.meter_dialog_inherit = false;
+                                        self.meter_dialog_num = ts.numerator;
+                                        self.meter_dialog_den = ts.denominator;
+                                    } else {
+                                        self.meter_dialog_inherit = true;
+                                        self.meter_dialog_num = project_ts.numerator;
+                                        self.meter_dialog_den = project_ts.denominator;
+                                    }
+                                }
+
                                 // Derived Length Display
                                 if sec_len == 0 {
                                     ui.small(egui::RichText::new("(Empty - 0t)").color(egui::Color32::GRAY));
                                 } else {
-                                    let bars = sec_len as f64 / 3840.0;
+                                    let tpb = sec_eff_ts.ticks_per_bar().max(1);
+                                    let bars = sec_len as f64 / tpb as f64;
                                     ui.small(format!("{:.1}b ({}t)", bars, sec_len));
                                 }
                             });
@@ -1560,6 +1773,17 @@ impl JamOutApp {
                                     badge_str,
                                     egui::FontId::monospace(10.0),
                                     egui::Color32::from_rgb(255, 180, 50),
+                                );
+                            }
+
+                            if let Some(ts) = block.time_signature {
+                                let badge_x = if block.tempo.is_some() { block_rect.left() + 52.0 } else { block_rect.left() + 6.0 };
+                                painter.text(
+                                    egui::pos2(badge_x, block_rect.bottom() - 14.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{}/{}", ts.numerator, ts.denominator),
+                                    egui::FontId::monospace(10.0),
+                                    egui::Color32::from_rgb(220, 150, 255),
                                 );
                             }
 
@@ -2018,6 +2242,17 @@ impl JamOutApp {
 
         ui.add_space(3.0);
 
+        let project_ts = self.last_status.as_ref().map(|s| s.time_signature).unwrap_or_default();
+        let (effective_ts, is_polymeter) = if let Some((ref s_id, _, ref blk)) = selected_block_info {
+            let sec_ts = self.last_status.as_ref()
+                .and_then(|s| s.sections.iter().find(|sec| &sec.id == s_id))
+                .and_then(|sec| sec.time_signature)
+                .unwrap_or(project_ts);
+            (blk.effective_time_signature(sec_ts), blk.time_signature.is_some())
+        } else {
+            (project_ts, false)
+        };
+
         // Scope Selector: Full Track vs Specific Section Block
         ui.horizontal(|ui| {
             ui.label("Scope:");
@@ -2039,10 +2274,39 @@ impl JamOutApp {
                 }
             }
 
-            if let Some((_, ref sec_name, ref blk)) = selected_block_info {
+            if let Some((ref s_id, ref sec_name, ref blk)) = selected_block_info {
                 ui.separator();
-                let bars = (blk.base_length_ticks as f32 / 3840.0).max(0.25);
+                let tpb = effective_ts.ticks_per_bar().max(1);
+                let bars = (blk.base_length_ticks as f32 / tpb as f32).max(0.25);
                 ui.label(egui::RichText::new(format!("Active: {} (Section: {}, Length: {:.1} bars / {}t)", blk.id, sec_name, bars, blk.base_length_ticks)).color(egui::Color32::from_rgb(255, 215, 0)).strong());
+
+                ui.separator();
+                let meter_label = format!("📏 {}/{}", effective_ts.numerator, effective_ts.denominator);
+                let btn_text = if is_polymeter {
+                    format!("{} [Polymeter]", meter_label)
+                } else {
+                    meter_label
+                };
+                let btn_color = if is_polymeter {
+                    egui::Color32::from_rgb(140, 50, 160)
+                } else {
+                    egui::Color32::from_rgb(45, 55, 70)
+                };
+                if ui.add(egui::Button::new(egui::RichText::new(btn_text).small()).fill(btn_color))
+                    .on_hover_text("Click to configure block meter / polymeter")
+                    .clicked()
+                {
+                    self.show_meter_dialog = Some((Some(s_id.clone()), Some(self.selected_track_id.clone())));
+                    if let Some(ts) = blk.time_signature {
+                        self.meter_dialog_inherit = false;
+                        self.meter_dialog_num = ts.numerator;
+                        self.meter_dialog_den = ts.denominator;
+                    } else {
+                        self.meter_dialog_inherit = true;
+                        self.meter_dialog_num = effective_ts.numerator;
+                        self.meter_dialog_den = effective_ts.denominator;
+                    }
+                }
             }
         });
 
@@ -2359,20 +2623,26 @@ impl JamOutApp {
                     }
                 }
 
-                // Vertical 16th-note & Bar lines
+                // Vertical 16th-note, Beat & Bar lines dynamically aligned to effective_ts
+                let ticks_per_bar = effective_ts.ticks_per_bar().max(1);
+                let ticks_per_beat = effective_ts.ticks_per_beat().max(1);
                 let total_16ths = (total_ticks / 240).max(1) as usize;
                 for step in 0..=total_16ths {
                     let step_pct = step as f32 / total_16ths as f32;
                     let x = grid_rect.left() + grid_rect.width() * step_pct;
-                    let is_bar = step % 16 == 0;
-                    let line_color = if is_bar {
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60)
+                    let tick = (step as u64) * 240;
+                    let is_bar = tick % ticks_per_bar == 0;
+                    let is_beat = tick % ticks_per_beat == 0;
+                    let (stroke_width, line_color) = if is_bar {
+                        (1.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80))
+                    } else if is_beat {
+                        (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35))
                     } else {
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15)
+                        (0.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12))
                     };
                     grid_painter.line_segment(
                         [egui::pos2(x, grid_rect.top()), egui::pos2(x, grid_rect.bottom())],
-                        egui::Stroke::new(if is_bar { 1.5 } else { 0.5 }, line_color),
+                        egui::Stroke::new(stroke_width, line_color),
                     );
                 }
 
