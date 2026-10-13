@@ -78,6 +78,7 @@ struct JamOutApp {
     // Live plugin / synth editor modal
     pub edit_track_id: Option<String>,
     pub edit_insert_slot: Option<(String, usize)>, // (track_id, insert_index)
+    pub edit_master_insert_slot: Option<usize>,
     pub preset_save_name: String,
     pub param_search_filter: String,
     pub plugin_search_filter: String,
@@ -323,6 +324,7 @@ impl JamOutApp {
             track_name_edits: HashMap::new(),
             edit_track_id: None,
             edit_insert_slot: None,
+            edit_master_insert_slot: None,
             preset_save_name: "custom_patch.json".to_string(),
             param_search_filter: String::new(),
             plugin_search_filter: String::new(),
@@ -1268,8 +1270,9 @@ impl eframe::App for JamOutApp {
                                                             ui.set_min_width(120.0);
                                                             ui.label(&p.name);
                                                             if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
-                                                                self.send_cmd(IpcCommand::SetTrackParam {
+                                                                self.send_cmd(IpcCommand::SetTrackInsertParam {
                                                                     track_id: tr_id.clone(),
+                                                                    insert_index: ins_idx,
                                                                     param_name: p.name.clone(),
                                                                     value: val,
                                                                 });
@@ -1298,6 +1301,62 @@ impl eframe::App for JamOutApp {
             }
         } else {
             self.edit_insert_slot = None;
+        }
+
+        // Master Bus Insert Effect Parameter Inspector Modal
+        if let Some(ins_idx) = self.edit_master_insert_slot {
+            let master_ins_opt = self.last_status.as_ref().and_then(|s| {
+                s.master_inserts.get(ins_idx).cloned()
+            });
+
+            if let Some(ins) = master_ins_opt {
+                let mut is_effect_open = true;
+                let mut stack = SlidingPanelStack::docked_left(44.0);
+                stack.panel(
+                    ctx,
+                    egui::Id::new("master_effect_inspector_window"),
+                    format!("⚡ Master Effect: {}", ins.name),
+                    &mut is_effect_open,
+                    |ui| {
+                        ui.label(format!("Plugin: {}", ins.name));
+                        ui.small(format!("URI: {}", ins.uri));
+                        ui.separator();
+
+                        if ins.params.is_empty() {
+                            ui.label("No exposed control parameters for this plugin.");
+                        } else {
+                            ui.label(format!("Parameters ({})", ins.params.len()));
+                            ui.add_space(4.0);
+
+                            egui::ScrollArea::vertical()
+                                .max_height(350.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for p in &ins.params {
+                                        let mut val = p.value;
+                                        ui.horizontal(|ui| {
+                                            ui.set_min_width(120.0);
+                                            ui.label(&p.name);
+                                            if ui.add(egui::Slider::new(&mut val, p.min..=p.max)).changed() {
+                                                self.send_cmd(IpcCommand::SetMasterInsertParam {
+                                                    insert_index: ins_idx,
+                                                    param_name: p.name.clone(),
+                                                    value: val,
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+                        }
+                    },
+                );
+
+                if !is_effect_open {
+                    self.edit_master_insert_slot = None;
+                }
+            } else {
+                self.edit_master_insert_slot = None;
+            }
         }
     }
 }
@@ -1655,6 +1714,7 @@ impl JamOutApp {
                                     self.active_tab = Tab::PianoRoll;
                                 }
                                 if ui.small_button("🎛").on_hover_text("Tweak Instruments & DSP").clicked() {
+                                    self.edit_master_insert_slot = None;
                                     self.edit_track_id = Some(track.id.clone());
                                 }
 
@@ -1911,6 +1971,7 @@ impl JamOutApp {
         let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
         let master_vol = self.last_status.as_ref().map(|s| s.master_volume).unwrap_or(0.9);
         let master_peak = self.last_status.as_ref().map(|s| s.master_peak).unwrap_or(0.0);
+        let master_inserts = self.last_status.as_ref().map(|s| s.master_inserts.clone()).unwrap_or_default();
 
         // --- 1. MASTER BUS ROW (Anchored at top) ---
         ui.group(|ui| {
@@ -1971,6 +2032,74 @@ impl JamOutApp {
                     });
                 });
             });
+
+            // Master Inserts Section
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("⚡ Master Inserts:").strong());
+
+                let available = self.last_status.as_ref()
+                    .map(|s| s.available_plugins.clone())
+                    .unwrap_or_default();
+
+                let chosen_effect = SearchablePicker::show(
+                    ui,
+                    "add_master_insert_sel".to_string(),
+                    "➕ Add Master Effect...",
+                    &mut self.insert_search_filter,
+                    &available,
+                    |plug| format!("{} ({})", plug.name, plug.plugin_format),
+                );
+
+                if let Some(plug) = chosen_effect {
+                    let display = format!("{} ({})", plug.name, plug.plugin_format);
+                    self.send_cmd(IpcCommand::AddMasterInsert {
+                        plugin_uri_or_path: plug.uri_or_path.clone(),
+                        plugin_name: display.clone(),
+                    });
+                    self.status_msg = format!("Added Master insert effect '{}'", display);
+                }
+
+                if master_inserts.is_empty() {
+                    ui.small("No master insert effects (e.g. Master Limiter, Compressor, EQ).");
+                }
+            });
+
+            if !master_inserts.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for (ins_idx, ins) in master_inserts.iter().enumerate() {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("{}. {}", ins_idx + 1, ins.name));
+                                let is_effect_active = self.edit_master_insert_slot == Some(ins_idx);
+                                let edit_btn = if is_effect_active {
+                                    egui::Button::new("🎛").fill(egui::Color32::from_rgb(50, 90, 150))
+                                } else {
+                                    egui::Button::new("🎛")
+                                };
+                                if ui.add(edit_btn).on_hover_text("Open Master Effect Controls in slide-out panel").clicked() {
+                                    if is_effect_active {
+                                        self.edit_master_insert_slot = None;
+                                    } else {
+                                        self.edit_track_id = None;
+                                        self.edit_insert_slot = None;
+                                        self.edit_master_insert_slot = Some(ins_idx);
+                                    }
+                                }
+                                if ui.small_button("🗑").on_hover_text("Remove this master effect").clicked() {
+                                    self.send_cmd(IpcCommand::RemoveMasterInsert {
+                                        insert_index: ins_idx,
+                                    });
+                                    self.status_msg = format!("Removed master insert effect '{}'", ins.name);
+                                    if self.edit_master_insert_slot == Some(ins_idx) {
+                                        self.edit_master_insert_slot = None;
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+            }
         });
 
         ui.add_space(10.0);
@@ -2023,6 +2152,7 @@ impl JamOutApp {
                                         if self.edit_track_id.as_deref() != Some(&track.id) {
                                             self.edit_insert_slot = None;
                                         }
+                                        self.edit_master_insert_slot = None;
                                         self.edit_track_id = Some(track.id.clone());
                                     }
                                     if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
