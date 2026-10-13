@@ -1546,12 +1546,18 @@ impl JamOutApp {
                             }
 
                             // --- INTERACTIVE DRAGGING: ITEM SLIDING & SLIP EDITING ---
-                            if cell_resp.clicked() {
+                            if cell_resp.double_clicked() {
                                 self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                                self.selected_track_id = track.id.clone();
+                                self.active_tab = Tab::PianoRoll;
+                            } else if cell_resp.clicked() {
+                                self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                                self.selected_track_id = track.id.clone();
                             }
 
                             if cell_resp.drag_started() {
                                 self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                                self.selected_track_id = track.id.clone();
                                 let is_slip = ui.input(|i| i.modifiers.alt);
                                 let start_pos = cell_resp.interact_pointer_pos().map(|p| p.x).unwrap_or(0.0);
                                 self.block_drag = Some(BlockDragState {
@@ -1618,6 +1624,7 @@ impl JamOutApp {
                                             block: new_block,
                                         });
                                         self.selected_block = Some((sec.id.clone(), track.id.clone()));
+                                        self.selected_track_id = track.id.clone();
                                     }
                                 });
                             });
@@ -1923,6 +1930,12 @@ impl JamOutApp {
     fn render_piano_roll_view(&mut self, ui: &mut egui::Ui) {
         let tracks = self.last_status.as_ref().map(|s| s.tracks.clone()).unwrap_or_default();
 
+        let available_blocks: Vec<(String, String, TrackBlock)> = self.last_status.as_ref().map(|st| {
+            st.sections.iter().filter_map(|s| {
+                s.track_blocks.get(&self.selected_track_id).map(|b| (s.id.clone(), s.name.clone(), b.clone()))
+            }).collect()
+        }).unwrap_or_default();
+
         let selected_block_info = if let Some((ref sec_id, ref t_id)) = self.selected_block {
             if t_id == &self.selected_track_id {
                 self.last_status.as_ref().and_then(|st| {
@@ -1942,19 +1955,11 @@ impl JamOutApp {
             ui.separator();
 
             // Track Selector
-            ui.label("Editing Track:");
+            ui.label("Track:");
             for t in &tracks {
                 let is_sel = self.selected_track_id == t.id;
                 if ui.selectable_label(is_sel, &t.name).clicked() {
                     self.selected_track_id = t.id.clone();
-                }
-            }
-
-            if let Some((_, ref sec_name, ref blk)) = selected_block_info {
-                ui.separator();
-                ui.label(egui::RichText::new(format!("🔲 Block Scope: {} ({})", blk.id, sec_name)).color(egui::Color32::from_rgb(255, 215, 0)).strong());
-                if ui.small_button("✕ Full Track").on_hover_text("Switch to editing entire track timeline").clicked() {
-                    self.selected_block = None;
                 }
             }
 
@@ -1979,6 +1984,36 @@ impl JamOutApp {
             let octave = (self.piano_roll_note_pitch / 12) as i32 - 1;
             let note_idx = (self.piano_roll_note_pitch % 12) as usize;
             ui.strong(format!("{}{}", note_names[note_idx], octave));
+        });
+
+        ui.add_space(3.0);
+
+        // Scope Selector: Full Track vs Specific Section Block
+        ui.horizontal(|ui| {
+            ui.label("Scope:");
+            let is_full = selected_block_info.is_none();
+            if ui.selectable_label(is_full, "🌐 Full Track Timeline").on_hover_text("View and edit the full song timeline across all sections").clicked() {
+                self.selected_block = None;
+            }
+
+            if available_blocks.is_empty() {
+                ui.small("(No blocks in this track. Click '➕ Add Block' in the Arranger grid to create a section block.)");
+            } else {
+                for (sec_id, sec_name, blk) in &available_blocks {
+                    let is_this = self.selected_block.as_ref() == Some(&(sec_id.clone(), self.selected_track_id.clone()));
+                    let label = format!("🔲 {} ({})", blk.id, sec_name);
+                    let resp = ui.selectable_label(is_this, label);
+                    if resp.clicked() {
+                        self.selected_block = Some((sec_id.clone(), self.selected_track_id.clone()));
+                    }
+                }
+            }
+
+            if let Some((_, ref sec_name, ref blk)) = selected_block_info {
+                ui.separator();
+                let bars = (blk.base_length_ticks as f32 / 3840.0).max(0.25);
+                ui.label(egui::RichText::new(format!("Active: {} (Section: {}, Length: {:.1} bars / {}t)", blk.id, sec_name, bars, blk.base_length_ticks)).color(egui::Color32::from_rgb(255, 215, 0)).strong());
+            }
         });
 
         ui.add_space(6.0);
