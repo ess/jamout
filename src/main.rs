@@ -38,6 +38,19 @@ pub struct BlockDragState {
     pub is_slip_edit: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct NoteMoveDragState {
+    pub note_on_id: u64,
+    pub note_off_id: Option<u64>,
+    pub orig_tick: u64,
+    pub orig_pitch: u8,
+    pub duration: u64,
+    pub grab_offset_ticks: i64,
+    pub velocity: f32,
+    pub current_tick: u64,
+    pub current_pitch: u8,
+}
+
 struct JamOutApp {
     _socket_path: String,
     connected: bool,
@@ -88,6 +101,7 @@ struct JamOutApp {
     // Note duration and drag drawing state
     pub note_duration_ticks: u64,
     pub drag_start: Option<(u64, u8)>, // (start_tick, pitch)
+    pub note_move_drag: Option<NoteMoveDragState>,
 
     // Matrix Arranger & Block Editing State
     pub block_drag: Option<BlockDragState>,
@@ -346,6 +360,7 @@ impl JamOutApp {
             effect_param_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
             drag_start: None,
+            note_move_drag: None,
             block_drag: None,
             show_tempo_dialog: None,
             tempo_dialog_mode: 0,
@@ -2887,7 +2902,7 @@ impl JamOutApp {
                     egui::Sense::click_and_drag(),
                 );
 
-                // Mouse down: register start of note drag
+                // Mouse down: register start of note drag (move existing note OR draw new note)
                 if grid_resp.drag_started_by(egui::PointerButton::Primary) {
                     if let Some(pos) = grid_resp.interact_pointer_pos() {
                         let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
@@ -2903,18 +2918,110 @@ impl JamOutApp {
                         let clicked_pitch = max_note.saturating_sub(row_idx);
                         self.piano_roll_note_pitch = clicked_pitch;
 
-                        // Prevent creating overlapping notes on the same pitch:
-                        if !block.has_note_at(clicked_pitch, clicked_tick) && !block.has_note_at(clicked_pitch, final_tick) {
-                            self.drag_start = Some((final_tick, clicked_pitch));
-                        } else {
+                        // Check if an existing note on clicked_pitch was clicked:
+                        let clicked_note = block.events.iter().enumerate().find_map(|(i, ev)| {
+                            if let jamseq::timeline::ScheduledAction::NoteOn { note, velocity } = ev.action {
+                                if note == clicked_pitch {
+                                    let note_off = block.events.iter().skip(i + 1).find(|off_ev| {
+                                        off_ev.tick > ev.tick
+                                            && match off_ev.action {
+                                                jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
+                                                _ => false,
+                                            }
+                                    });
+                                    let note_off_tick = note_off.map(|off| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
+                                    let duration = note_off_tick.saturating_sub(ev.tick).max(60);
+                                    let min_ticks = ((6.0 / grid_rect.width().max(1.0)) * total_ticks as f32) as u64;
+                                    let end_tick = (ev.tick + duration).max(ev.tick + min_ticks);
+                                    let tolerance = 40u64;
+                                    if clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick <= end_tick + tolerance {
+                                        return Some((ev.id, note_off.map(|off| off.id), ev.tick, duration, note, velocity));
+                                    }
+                                }
+                            }
+                            None
+                        });
+
+                        if let Some((on_id, off_id, orig_tick, duration, orig_pitch, velocity)) = clicked_note {
+                            // User clicked an existing note -> start moving it!
+                            let grab_offset = clicked_tick as i64 - orig_tick as i64;
+                            self.note_move_drag = Some(NoteMoveDragState {
+                                note_on_id: on_id,
+                                note_off_id: off_id,
+                                orig_tick,
+                                orig_pitch,
+                                duration,
+                                grab_offset_ticks: grab_offset,
+                                velocity,
+                                current_tick: orig_tick,
+                                current_pitch: orig_pitch,
+                            });
                             self.drag_start = None;
+                        } else {
+                            // Dragging on empty space -> draw new note mode
+                            self.note_move_drag = None;
+                            if !block.has_note_at(clicked_pitch, clicked_tick) && !block.has_note_at(clicked_pitch, final_tick) {
+                                self.drag_start = Some((final_tick, clicked_pitch));
+                            } else {
+                                self.drag_start = None;
+                            }
                         }
                     }
                 }
 
-                // Mouse release: commit note with dragged or selected duration
+                // Dragging in progress: update moving note position
+                if grid_resp.dragged() {
+                    if let Some(ref mut move_state) = self.note_move_drag {
+                        if let Some(pos) = grid_resp.interact_pointer_pos() {
+                            let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
+                            let raw_tick = (pct_x * total_ticks as f32) as u64;
+                            let row_idx = ((pos.y - grid_rect.top()) / row_height).floor().clamp(0.0, (num_notes.saturating_sub(1)) as f32) as u8;
+                            let new_pitch = max_note.saturating_sub(row_idx);
+
+                            let shift_held = ui.input(|i| i.modifiers.shift);
+                            let unadjusted_tick = (raw_tick as i64 - move_state.grab_offset_ticks).max(0) as u64;
+                            let snapped_tick = if shift_held || self.freehand_drift {
+                                unadjusted_tick
+                            } else {
+                                (unadjusted_tick / 240) * 240
+                            };
+                            let max_tick = total_ticks.saturating_sub(move_state.duration);
+                            let clamped_tick = snapped_tick.min(max_tick);
+
+                            move_state.current_tick = clamped_tick;
+                            move_state.current_pitch = new_pitch;
+                        }
+                    }
+                }
+
+                // Mouse release: commit moved note or drawn note
                 if grid_resp.drag_stopped_by(egui::PointerButton::Primary) {
-                    if let Some((start_tick, pitch)) = self.drag_start.take() {
+                    if let Some(move_state) = self.note_move_drag.take() {
+                        if move_state.current_tick != move_state.orig_tick || move_state.current_pitch != move_state.orig_pitch {
+                            let mut updated = block.clone();
+                            // Remove original note
+                            updated.events.retain(|e| {
+                                e.id != move_state.note_on_id && Some(e.id) != move_state.note_off_id
+                            });
+
+                            if updated.has_note_at(move_state.current_pitch, move_state.current_tick) {
+                                self.status_msg = format!("Cannot move: pitch {} is already occupied at tick {}", move_state.current_pitch, move_state.current_tick);
+                            } else {
+                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                updated.add_note(
+                                    now_ms,
+                                    now_ms + 1,
+                                    move_state.current_tick,
+                                    move_state.duration,
+                                    move_state.current_pitch,
+                                    move_state.velocity,
+                                );
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
+                                self.piano_roll_note_pitch = move_state.current_pitch;
+                                self.status_msg = format!("Block '{}': Moved note to pitch {} at tick {}", block.id, move_state.current_pitch, move_state.current_tick);
+                            }
+                        }
+                    } else if let Some((start_tick, pitch)) = self.drag_start.take() {
                         if !block.has_note_at(pitch, start_tick) {
                             let max_len = if let Some(next_start) = block.next_note_start(pitch, start_tick) {
                                 next_start.saturating_sub(start_tick)
@@ -2948,7 +3055,7 @@ impl JamOutApp {
                             }
                         }
                     }
-                } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() {
+                } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() && self.note_move_drag.is_none() {
                     // Normal single click: places note with currently selected duration
                     if let Some(pos) = grid_resp.interact_pointer_pos() {
                         let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
@@ -3138,9 +3245,38 @@ impl JamOutApp {
                                 egui::vec2(note_w, row_height - 2.0),
                             );
 
-                            grid_painter.rect_filled(n_rect, 2.0, egui::Color32::from_rgb(90, 190, 255));
-                            grid_painter.rect_stroke(n_rect, 2.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+                            let is_being_moved = self.note_move_drag.as_ref().map(|d| d.note_on_id == ev.id).unwrap_or(false);
+                            let fill_color = if is_being_moved {
+                                egui::Color32::from_rgba_unmultiplied(90, 190, 255, 50)
+                            } else {
+                                egui::Color32::from_rgb(90, 190, 255)
+                            };
+                            let stroke = if is_being_moved {
+                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50))
+                            } else {
+                                egui::Stroke::new(1.0, egui::Color32::WHITE)
+                            };
+
+                            grid_painter.rect_filled(n_rect, 2.0, fill_color);
+                            grid_painter.rect_stroke(n_rect, 2.0, stroke);
                         }
+                    }
+                }
+
+                // Draw ghost preview for note being moved
+                if let Some(ref move_state) = self.note_move_drag {
+                    if move_state.current_pitch >= min_note && move_state.current_pitch <= max_note && total_ticks > 0 {
+                        let row = (max_note - move_state.current_pitch) as f32;
+                        let y = grid_rect.top() + row * row_height;
+                        let note_pct = (move_state.current_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
+                        let note_x = grid_rect.left() + grid_rect.width() * note_pct;
+                        let note_w = (grid_rect.width() * (move_state.duration as f32 / total_ticks as f32)).max(6.0);
+                        let move_rect = egui::Rect::from_min_size(
+                            egui::pos2(note_x, y + 1.0),
+                            egui::vec2(note_w, row_height - 2.0),
+                        );
+                        grid_painter.rect_filled(move_rect, 2.0, egui::Color32::from_rgba_unmultiplied(100, 220, 255, 180));
+                        grid_painter.rect_stroke(move_rect, 2.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 255, 120)));
                     }
                 }
 
