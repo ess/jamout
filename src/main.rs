@@ -66,7 +66,6 @@ struct JamOutApp {
     // Song section management UI state
     pub show_section_dialog: bool,
     pub new_section_name: String,
-    pub new_section_energy: u8,
 
     // Piano roll state
     pub selected_track_id: String,
@@ -311,7 +310,6 @@ impl JamOutApp {
             new_project_bpm: 68.0,
             show_section_dialog: false,
             new_section_name: "Verse 1".to_string(),
-            new_section_energy: 5,
             selected_track_id: "bass".to_string(),
             piano_roll_note_pitch: 50, // D3 default
             track_name_edits: HashMap::new(),
@@ -660,11 +658,6 @@ impl eframe::App for JamOutApp {
                         ui.text_edit_singleline(&mut self.new_section_name);
                     });
 
-                    ui.horizontal(|ui| {
-                        ui.label("Arrangement Energy (1-10):");
-                        ui.add(egui::Slider::new(&mut self.new_section_energy, 1..=10));
-                    });
-
                     ui.add_space(8.0);
                     ui.separator();
 
@@ -678,7 +671,6 @@ impl eframe::App for JamOutApp {
                                     name: name.to_string(),
                                     start_tick: 0,
                                     length_ticks: 0,
-                                    energy: self.new_section_energy,
                                 });
                                 self.status_msg = format!("Added section '{}'", name);
                                 self.show_section_dialog = false;
@@ -1362,8 +1354,6 @@ impl JamOutApp {
                                 if ui.add(sec_btn).on_hover_text("Click to seek playhead to section downbeat").clicked() {
                                     self.send_cmd(IpcCommand::Seek { tick: sec_start_tick });
                                 }
-
-                                ui.small(format!("⚡{}", sec.energy));
 
                                 if ui.small_button("🗑").on_hover_text("Delete section").clicked() {
                                     self.send_cmd(IpcCommand::RemoveSection { section_id: sec.id.clone() });
