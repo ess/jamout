@@ -2902,36 +2902,51 @@ impl JamOutApp {
                         let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
                         let clicked_pitch = max_note.saturating_sub(row_idx);
                         self.piano_roll_note_pitch = clicked_pitch;
-                        self.drag_start = Some((final_tick, clicked_pitch));
+
+                        // Prevent creating overlapping notes on the same pitch:
+                        if !block.has_note_at(clicked_pitch, clicked_tick) && !block.has_note_at(clicked_pitch, final_tick) {
+                            self.drag_start = Some((final_tick, clicked_pitch));
+                        } else {
+                            self.drag_start = None;
+                        }
                     }
                 }
 
                 // Mouse release: commit note with dragged or selected duration
                 if grid_resp.drag_stopped_by(egui::PointerButton::Primary) {
                     if let Some((start_tick, pitch)) = self.drag_start.take() {
-                        let final_duration = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                            let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                            let current_tick = (pct_x * total_ticks as f32) as u64;
-                            if current_tick > start_tick {
-                                let shift_held = ui.input(|i| i.modifiers.shift);
-                                let drag_len = if shift_held || self.freehand_drift {
-                                    current_tick - start_tick
-                                } else {
-                                    ((current_tick - start_tick + 120) / 240) * 240
-                                };
-                                drag_len.max(self.note_duration_ticks)
+                        if !block.has_note_at(pitch, start_tick) {
+                            let max_len = if let Some(next_start) = block.next_note_start(pitch, start_tick) {
+                                next_start.saturating_sub(start_tick)
                             } else {
-                                self.note_duration_ticks
-                            }
-                        } else {
-                            self.note_duration_ticks
-                        };
+                                u64::MAX
+                            };
+                            let final_duration = if let Some(pos) = grid_resp.interact_pointer_pos() {
+                                let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
+                                let current_tick = (pct_x * total_ticks as f32) as u64;
+                                if current_tick > start_tick {
+                                    let shift_held = ui.input(|i| i.modifiers.shift);
+                                    let drag_len = if shift_held || self.freehand_drift {
+                                        current_tick - start_tick
+                                    } else {
+                                        ((current_tick - start_tick + 120) / 240) * 240
+                                    };
+                                    drag_len.max(self.note_duration_ticks).min(max_len)
+                                } else {
+                                    self.note_duration_ticks.min(max_len)
+                                }
+                            } else {
+                                self.note_duration_ticks.min(max_len)
+                            };
 
-                        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                        let mut updated = block.clone();
-                        updated.add_note(now_ms, now_ms + 1, start_tick, final_duration, pitch, 0.9);
-                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                        self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", block.id, pitch, start_tick, final_duration);
+                            if final_duration > 0 {
+                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                let mut updated = block.clone();
+                                updated.add_note(now_ms, now_ms + 1, start_tick, final_duration, pitch, 0.9);
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
+                                self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", block.id, pitch, start_tick, final_duration);
+                            }
+                        }
                     }
                 } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() {
                     // Normal single click: places note with currently selected duration
@@ -2950,11 +2965,24 @@ impl JamOutApp {
                         let clicked_pitch = max_note.saturating_sub(row_idx);
                         self.piano_roll_note_pitch = clicked_pitch;
 
-                        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                        let mut updated = block.clone();
-                        updated.add_note(now_ms, now_ms + 1, final_tick, self.note_duration_ticks, clicked_pitch, 0.9);
-                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                        self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", block.id, clicked_pitch, final_tick, self.note_duration_ticks);
+                        // Check if clicked position or final_tick is inside an existing note on this pitch
+                        if block.has_note_at(clicked_pitch, clicked_tick) || block.has_note_at(clicked_pitch, final_tick) {
+                            self.status_msg = format!("Block '{}': Note already exists on pitch {} at tick {}", block.id, clicked_pitch, clicked_tick);
+                        } else {
+                            let max_len = if let Some(next_start) = block.next_note_start(clicked_pitch, final_tick) {
+                                next_start.saturating_sub(final_tick)
+                            } else {
+                                u64::MAX
+                            };
+                            let final_duration = self.note_duration_ticks.min(max_len);
+                            if final_duration > 0 {
+                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                let mut updated = block.clone();
+                                updated.add_note(now_ms, now_ms + 1, final_tick, final_duration, clicked_pitch, 0.9);
+                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
+                                self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", block.id, clicked_pitch, final_tick, final_duration);
+                            }
+                        }
                     }
                 } else if grid_resp.secondary_clicked() {
                     // Right click deletes note anywhere along its duration
@@ -3121,7 +3149,12 @@ impl JamOutApp {
                     if let Some(pos) = grid_resp.interact_pointer_pos() {
                         let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                         let cur_tick = (pct_x * total_ticks as f32) as u64;
-                        let preview_len = cur_tick.saturating_sub(start_tick).max(self.note_duration_ticks);
+                        let max_len = if let Some(next_start) = block.next_note_start(pitch, start_tick) {
+                            next_start.saturating_sub(start_tick)
+                        } else {
+                            u64::MAX
+                        };
+                        let preview_len = cur_tick.saturating_sub(start_tick).max(self.note_duration_ticks).min(max_len);
                         if pitch >= min_note && pitch <= max_note {
                             let row = (max_note - pitch) as f32;
                             let y = grid_rect.top() + row * row_height;
