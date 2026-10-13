@@ -90,7 +90,6 @@ struct JamOutApp {
     pub drag_start: Option<(u64, u8)>, // (start_tick, pitch)
 
     // Matrix Arranger & Block Editing State
-    pub selected_block: Option<(String, String)>, // (section_id, track_id)
     pub block_drag: Option<BlockDragState>,
     pub show_tempo_dialog: Option<(String, Option<String>)>, // (section_id, Option<track_id>)
     pub tempo_dialog_mode: usize, // 0 = Inherited, 1 = Absolute BPM, 2 = Ratio
@@ -347,7 +346,6 @@ impl JamOutApp {
             effect_param_search_filter: String::new(),
             note_duration_ticks: 480, // 1/8 note default
             drag_start: None,
-            selected_block: None,
             block_drag: None,
             show_tempo_dialog: None,
             tempo_dialog_mode: 0,
@@ -1753,31 +1751,6 @@ impl JamOutApp {
         let project_bpm = self.last_status.as_ref().map(|s| s.bpm).unwrap_or(120.0);
         let project_ts = self.last_status.as_ref().map(|s| s.time_signature).unwrap_or_default();
 
-        // --- 0. KEYBOARD SHORTCUTS FOR SELECTED BLOCK NUDGING ---
-        if let Some((ref sec_id, ref track_id)) = self.selected_block.clone() {
-            let alt_held = ui.input(|i| i.modifiers.alt);
-            if alt_held {
-                let nudge_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-                let nudge_right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
-                if nudge_left || nudge_right {
-                    if let Some(sec) = sections.iter().find(|s| s.id == *sec_id) {
-                        if let Some(block) = sec.track_blocks.get(track_id) {
-                            let mut updated = block.clone();
-                            if nudge_left {
-                                updated.start_offset_ticks = updated.start_offset_ticks.saturating_sub(240);
-                            } else {
-                                updated.start_offset_ticks += 240;
-                            }
-                            self.send_cmd(IpcCommand::SetTrackBlock {
-                                section_id: sec_id.clone(),
-                                block: updated,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
         // --- 1. TOP HEADER & TRANSPORT TIMELINE ---
         ui.horizontal(|ui| {
             ui.heading("Arrangement Matrix Arranger");
@@ -1799,117 +1772,6 @@ impl JamOutApp {
         });
 
         ui.add_space(6.0);
-
-        // --- 2. SELECTED BLOCK INSPECTOR & NUDGE TOOLBAR ---
-        if let Some((ref sec_id, ref track_id)) = self.selected_block.clone() {
-            if let Some(sec) = sections.iter().find(|s| s.id == *sec_id) {
-                if let Some(block) = sec.track_blocks.get(track_id) {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("🔍 Selected Block: {} / {}", sec.name, track_id)).strong());
-
-                            ui.separator();
-                            ui.label("Start Offset:");
-                            let mut offset = block.start_offset_ticks;
-                            let bar = (offset / 3840) + 1;
-                            let beat = ((offset % 3840) as f64 / 960.0) + 1.0;
-                            ui.small(format!("(Bar {}.{:.1})", bar, beat));
-                            if ui.add(egui::DragValue::new(&mut offset).speed(240).range(0..=1000000)).changed() {
-                                let mut updated = block.clone();
-                                updated.start_offset_ticks = offset;
-                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                            }
-
-                            // Nudge buttons
-                            if ui.small_button("◀ -240t").on_hover_text("Nudge earlier 1/16 note (Alt+Left)").clicked() {
-                                let mut updated = block.clone();
-                                updated.start_offset_ticks = updated.start_offset_ticks.saturating_sub(240);
-                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                            }
-                            if ui.small_button("+240t ▶").on_hover_text("Nudge later 1/16 note (Alt+Right)").clicked() {
-                                let mut updated = block.clone();
-                                updated.start_offset_ticks += 240;
-                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                            }
-
-                            ui.separator();
-                            ui.label("Base Length:");
-                            let mut base_len = block.base_length_ticks;
-                            if ui.add(egui::DragValue::new(&mut base_len).speed(240).range(240..=1000000)).changed() {
-                                let mut updated = block.clone();
-                                updated.base_length_ticks = base_len;
-                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                            }
-
-                            ui.separator();
-                            ui.label("Loop Mode:");
-                            let mode_label = match block.loop_mode {
-                                LoopMode::OneShot => "One-Shot (1x)",
-                                LoopMode::LoopToSection => "Loop To Section",
-                                LoopMode::FixedLoops(n) => if n == 2 { "Loop 2x" } else { "Loop 4x" },
-                            };
-                            egui::ComboBox::from_id_salt("block_loop_combo")
-                                .selected_text(mode_label)
-                                .show_ui(ui, |ui| {
-                                    if ui.selectable_label(block.loop_mode == LoopMode::OneShot, "One-Shot (1x)").clicked() {
-                                        let mut updated = block.clone();
-                                        updated.loop_mode = LoopMode::OneShot;
-                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                                    }
-                                    if ui.selectable_label(block.loop_mode == LoopMode::LoopToSection, "Loop To Section").clicked() {
-                                        let mut updated = block.clone();
-                                        updated.loop_mode = LoopMode::LoopToSection;
-                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                                    }
-                                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(2), "Loop 2x").clicked() {
-                                        let mut updated = block.clone();
-                                        updated.loop_mode = LoopMode::FixedLoops(2);
-                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                                    }
-                                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(4), "Loop 4x").clicked() {
-                                        let mut updated = block.clone();
-                                        updated.loop_mode = LoopMode::FixedLoops(4);
-                                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec.id.clone(), block: updated });
-                                    }
-                                });
-
-                            ui.separator();
-                            if ui.button("⏱ Block Tempo").clicked() {
-                                self.show_tempo_dialog = Some((sec.id.clone(), Some(track_id.clone())));
-                            }
-
-                            if ui.button("📏 Block Meter").clicked() {
-                                self.show_meter_dialog = Some((Some(sec.id.clone()), Some(track_id.clone())));
-                                if let Some(ts) = block.time_signature {
-                                    self.meter_dialog_inherit = false;
-                                    self.meter_dialog_num = ts.numerator;
-                                    self.meter_dialog_den = ts.denominator;
-                                } else {
-                                    self.meter_dialog_inherit = true;
-                                    let parent_ts = sec.time_signature.unwrap_or(project_ts);
-                                    self.meter_dialog_num = parent_ts.numerator;
-                                    self.meter_dialog_den = parent_ts.denominator;
-                                }
-                            }
-
-                            if ui.button("🎹 Piano Roll").clicked() {
-                                self.selected_track_id = track_id.clone();
-                                self.open_piano_roll_block = Some((sec.id.clone(), track_id.clone()));
-                            }
-
-                            if ui.small_button("🗑").on_hover_text("Delete track block").clicked() {
-                                self.send_cmd(IpcCommand::RemoveTrackBlock {
-                                    section_id: sec.id.clone(),
-                                    track_id: track_id.clone(),
-                                });
-                                self.selected_block = None;
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
-            }
-        }
 
         // --- 3. MATRIX ARRANGER GRID (Sections Columns x Tracks Rows) ---
         egui::ScrollArea::both().show(ui, |ui| {
@@ -2069,8 +1931,7 @@ impl JamOutApp {
 
                             if ui.small_button("🎹").on_hover_text("Open Piano Roll for this track").clicked() {
                                 if let Some((s_id, _)) = sections.iter().find_map(|s| s.track_blocks.get(&track.id).map(|_| (s.id.clone(), track.id.clone()))) {
-                                    self.open_piano_roll_block = Some((s_id.clone(), track.id.clone()));
-                                    self.selected_block = Some((s_id, track.id.clone()));
+                                    self.open_piano_roll_block = Some((s_id, track.id.clone()));
                                     self.selected_track_id = track.id.clone();
                                 } else {
                                     self.status_msg = format!("Track '{}' has no blocks yet. Click '+ Add Block' in a section.", track.name);
@@ -2122,7 +1983,7 @@ impl JamOutApp {
 
                         // If track has a block inside this section:
                         if let Some(block) = sec.track_blocks.get(&track.id) {
-                            let is_selected = self.selected_block.as_ref() == Some(&(sec.id.clone(), track.id.clone()));
+                            let is_open_in_piano_roll = self.open_piano_roll_block.as_ref() == Some(&(sec.id.clone(), track.id.clone()));
 
                             // REAPER-style horizontal item positioning within cell
                             let block_rect = if sec_len > 0 {
@@ -2143,7 +2004,7 @@ impl JamOutApp {
                                 egui::Color32::from_rgb(45, 80, 55) // Green Drums
                             };
 
-                            let stroke = if is_selected {
+                            let stroke = if is_open_in_piano_roll {
                                 egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 215, 0))
                             } else {
                                 egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60))
@@ -2152,6 +2013,63 @@ impl JamOutApp {
                             let painter = ui.painter();
                             painter.rect(block_rect, 4.0, card_color, stroke);
 
+                            // Interactive Buttons on Block Card: Piano Roll & Delete
+                            let piano_btn_rect = egui::Rect::from_min_size(
+                                egui::pos2(block_rect.left() + 3.0, block_rect.top() + 3.0),
+                                egui::vec2(16.0, 15.0),
+                            );
+                            let del_btn_rect = egui::Rect::from_min_size(
+                                egui::pos2(block_rect.right() - 19.0, block_rect.top() + 3.0),
+                                egui::vec2(16.0, 15.0),
+                            );
+
+                            let piano_id = ui.make_persistent_id(format!("piano_btn_{}_{}", sec.id, track.id));
+                            let piano_resp = ui.interact(piano_btn_rect, piano_id, egui::Sense::click()).on_hover_text("Open Piano Roll");
+
+                            let del_id = ui.make_persistent_id(format!("del_btn_{}_{}", sec.id, track.id));
+                            let del_resp = ui.interact(del_btn_rect, del_id, egui::Sense::click()).on_hover_text("Delete Block");
+
+                            if piano_resp.clicked() {
+                                self.selected_track_id = track.id.clone();
+                                self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
+                            }
+                            if del_resp.clicked() {
+                                self.send_cmd(IpcCommand::RemoveTrackBlock {
+                                    section_id: sec.id.clone(),
+                                    track_id: track.id.clone(),
+                                });
+                                if self.open_piano_roll_block.as_ref() == Some(&(sec.id.clone(), track.id.clone())) {
+                                    self.open_piano_roll_block = None;
+                                }
+                            }
+
+                            // Draw Piano & Del buttons
+                            let piano_color = if piano_resp.hovered() {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210)
+                            };
+                            painter.text(
+                                piano_btn_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "🎹",
+                                egui::FontId::proportional(11.0),
+                                piano_color,
+                            );
+
+                            let del_color = if del_resp.hovered() {
+                                egui::Color32::from_rgb(255, 100, 100)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(220, 220, 220, 150)
+                            };
+                            painter.text(
+                                del_btn_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "🗑",
+                                egui::FontId::proportional(10.0),
+                                del_color,
+                            );
+
                             // Block title & offset readout
                             let title_text = if block.start_offset_ticks > 0 {
                                 format!("{} (+{}t)", block.id, block.start_offset_ticks)
@@ -2159,10 +2077,10 @@ impl JamOutApp {
                                 block.id.clone()
                             };
                             painter.text(
-                                egui::pos2(block_rect.left() + 6.0, block_rect.top() + 4.0),
+                                egui::pos2(piano_btn_rect.right() + 3.0, block_rect.top() + 4.0),
                                 egui::Align2::LEFT_TOP,
                                 title_text,
-                                egui::FontId::proportional(11.0),
+                                egui::FontId::proportional(10.5),
                                 egui::Color32::WHITE,
                             );
 
@@ -2173,7 +2091,7 @@ impl JamOutApp {
                                 LoopMode::FixedLoops(n) => if n == 2 { "2x" } else { "4x" },
                             };
                             painter.text(
-                                egui::pos2(block_rect.right() - 6.0, block_rect.top() + 4.0),
+                                egui::pos2(del_btn_rect.left() - 4.0, block_rect.top() + 4.0),
                                 egui::Align2::RIGHT_TOP,
                                 mode_pill,
                                 egui::FontId::monospace(10.0),
@@ -2217,28 +2135,29 @@ impl JamOutApp {
                                 }
                             }
 
-                            // --- INTERACTIVE CLICKS & DRAGGING ---
-                            if cell_resp.double_clicked() {
-                                self.selected_block = Some((sec.id.clone(), track.id.clone()));
-                                self.selected_track_id = track.id.clone();
-                                self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
-                            } else if cell_resp.clicked() {
-                                self.selected_block = Some((sec.id.clone(), track.id.clone()));
-                                self.selected_track_id = track.id.clone();
-                            }
+                            let btn_hit = piano_resp.hovered() || del_resp.hovered() || piano_resp.clicked() || del_resp.clicked();
 
-                            if cell_resp.drag_started() {
-                                self.selected_block = Some((sec.id.clone(), track.id.clone()));
-                                self.selected_track_id = track.id.clone();
-                                let is_slip = ui.input(|i| i.modifiers.alt);
-                                let start_pos = cell_resp.interact_pointer_pos().map(|p| p.x).unwrap_or(0.0);
-                                self.block_drag = Some(BlockDragState {
-                                    section_id: sec.id.clone(),
-                                    track_id: track.id.clone(),
-                                    initial_offset: block.start_offset_ticks,
-                                    start_pos_x: start_pos,
-                                    is_slip_edit: is_slip,
-                                });
+                            // --- INTERACTIVE CLICKS & DRAGGING ---
+                            if !btn_hit {
+                                if cell_resp.double_clicked() {
+                                    self.selected_track_id = track.id.clone();
+                                    self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
+                                } else if cell_resp.clicked() {
+                                    self.selected_track_id = track.id.clone();
+                                }
+
+                                if cell_resp.drag_started() {
+                                    self.selected_track_id = track.id.clone();
+                                    let is_slip = ui.input(|i| i.modifiers.alt);
+                                    let start_pos = cell_resp.interact_pointer_pos().map(|p| p.x).unwrap_or(0.0);
+                                    self.block_drag = Some(BlockDragState {
+                                        section_id: sec.id.clone(),
+                                        track_id: track.id.clone(),
+                                        initial_offset: block.start_offset_ticks,
+                                        start_pos_x: start_pos,
+                                        is_slip_edit: is_slip,
+                                    });
+                                }
                             }
 
                             if cell_resp.dragged() {
@@ -2295,7 +2214,6 @@ impl JamOutApp {
                                         section_id: sec.id.clone(),
                                         block: new_block,
                                     });
-                                    self.selected_block = Some((sec.id.clone(), track.id.clone()));
                                     self.selected_track_id = track.id.clone();
                                     self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
                                 }
