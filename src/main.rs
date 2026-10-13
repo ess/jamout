@@ -482,7 +482,13 @@ fn render_grouped_parameter_list<F>(
                                 }
                             }
                             ParamType::Enum { labels } => {
-                                let current_idx = (param.value - param.min).round() as usize;
+                                let is_normalized = labels.len() > 1 && (param.max - param.min) <= 1.0;
+                                let current_idx = if is_normalized {
+                                    let norm = ((param.value - param.min) / (param.max - param.min)).clamp(0.0, 1.0);
+                                    (norm * (labels.len() - 1) as f32).round() as usize
+                                } else {
+                                    (param.value - param.min).round() as usize
+                                };
                                 let current_label = labels.get(current_idx).cloned()
                                     .or_else(|| param.display_value.clone())
                                     .unwrap_or_else(|| format!("{:.0}", param.value));
@@ -493,7 +499,12 @@ fn render_grouped_parameter_list<F>(
                                         for (i, lbl) in labels.iter().enumerate() {
                                             let is_selected = i == current_idx;
                                             if ui.selectable_label(is_selected, lbl).clicked() {
-                                                on_change(&param.name, param.min + i as f32);
+                                                let target_val = if is_normalized {
+                                                    param.min + (i as f32 / (labels.len() - 1) as f32) * (param.max - param.min)
+                                                } else {
+                                                    param.min + i as f32
+                                                };
+                                                on_change(&param.name, target_val);
                                             }
                                         }
                                     });
