@@ -3071,31 +3071,29 @@ impl JamOutApp {
                 let end_x = grid_rect.left() + end_pct * grid_rect.width();
 
                 let is_resizing_block_now = self.piano_roll_resizing_block.is_some();
-                let badge_w = 42.0;
-                let is_on_badge = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                    pos.y <= grid_rect.top() + 20.0 && pos.x >= (end_x - badge_w).max(grid_rect.left()) && pos.x <= end_x + 4.0
+                let badge_w = 62.0;
+                let badge_h = 18.0;
+                let visible_center_y = ui.clip_rect().center().y.clamp(grid_rect.top() + badge_h, grid_rect.bottom() - badge_h);
+                let badge_rect = egui::Rect::from_min_size(
+                    egui::pos2(end_x + 2.0, visible_center_y - badge_h / 2.0),
+                    egui::vec2(badge_w, badge_h),
+                );
+                let is_hovering_badge = if let Some(pos) = grid_resp.interact_pointer_pos() {
+                    badge_rect.contains(pos)
                 } else {
                     false
                 };
-                let is_on_end_line = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                    pos.x >= end_x - 3.0 && pos.x <= end_x + 8.0
-                } else {
-                    false
-                };
-                let is_hovering_end_marker = is_on_badge || is_on_end_line;
-                if is_hovering_end_marker || is_resizing_block_now {
+                if is_hovering_badge || is_resizing_block_now {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
 
                 // Mouse down: register start of note drag (move existing note OR draw new note OR resize block)
                 if grid_resp.drag_started_by(egui::PointerButton::Primary) {
-                    if let Some(pos) = grid_resp.interact_pointer_pos() {
-                        let is_on_end_marker = is_on_badge || is_on_end_line;
-                        if is_on_end_marker {
-                            self.piano_roll_resizing_block = Some(block.base_length_ticks);
-                            self.drag_start = None;
-                            self.note_move_drag = None;
-                        } else {
+                    if is_hovering_badge {
+                        self.piano_roll_resizing_block = Some(block.base_length_ticks);
+                        self.drag_start = None;
+                        self.note_move_drag = None;
+                    } else if let Some(pos) = grid_resp.interact_pointer_pos() {
                             let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                             let clicked_tick = (pct_x * total_ticks as f32) as u64;
                             let shift_held = ui.input(|i| i.modifiers.shift);
@@ -3169,7 +3167,7 @@ impl JamOutApp {
                             }
                         }
                     }
-                }
+
 
                 // Dragging in progress: update moving note position OR resizing block
                 if grid_resp.dragged() {
@@ -3282,8 +3280,7 @@ impl JamOutApp {
                 } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() && self.note_move_drag.is_none() && self.piano_roll_resizing_block.is_none() {
                     // Normal single click: places note with currently selected duration
                     if let Some(pos) = grid_resp.interact_pointer_pos() {
-                        let is_on_end_marker = is_on_badge || (pos.x >= end_x - 2.0 && pos.x <= end_x + 8.0);
-                        if !is_on_end_marker {
+                        if !is_hovering_badge {
                             let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                             let clicked_tick = (pct_x * total_ticks as f32) as u64;
                             let shift_held = ui.input(|i| i.modifiers.shift);
@@ -3623,7 +3620,7 @@ impl JamOutApp {
                 }
 
                 // Block End Marker Line & Draggable Badge
-                let marker_color = if is_hovering_end_marker || is_resizing_block_now {
+                let marker_color = if is_hovering_badge || is_resizing_block_now {
                     egui::Color32::from_rgb(255, 90, 90)
                 } else {
                     egui::Color32::from_rgb(210, 60, 60)
@@ -3633,17 +3630,11 @@ impl JamOutApp {
                     egui::Stroke::new(2.0, marker_color),
                 );
 
-                let badge_w = 42.0;
-                let badge_h = 16.0;
-                let badge_rect = egui::Rect::from_min_size(
-                    egui::pos2((end_x - badge_w).max(grid_rect.left()), grid_rect.top() + 2.0),
-                    egui::vec2(badge_w, badge_h),
-                );
                 grid_painter.rect_filled(badge_rect, 3.0, marker_color);
                 grid_painter.text(
                     badge_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "◀ END",
+                    "◀ END ▶",
                     egui::FontId::proportional(10.0),
                     egui::Color32::WHITE,
                 );
