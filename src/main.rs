@@ -348,7 +348,7 @@ impl JamOutApp {
             active_tab: Tab::Timeline,
             lyrics,
             _drift_ticks: 20,       // ±20 ticks Gaussian feel
-            drag_bias_ticks: 15,   // +15 ticks lazy 90s R&B drag
+            drag_bias_ticks: 0,    // Default 0 ticks (strict grid alignment)
             freehand_drift: false,
             show_project_dialog: false,
             project_path_input: String::new(),
@@ -3071,11 +3071,18 @@ impl JamOutApp {
                 let end_x = grid_rect.left() + end_pct * grid_rect.width();
 
                 let is_resizing_block_now = self.piano_roll_resizing_block.is_some();
-                let is_hovering_end_marker = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                    pos.x >= end_x - 10.0 && pos.x <= end_x + 10.0
+                let badge_w = 42.0;
+                let is_on_badge = if let Some(pos) = grid_resp.interact_pointer_pos() {
+                    pos.y <= grid_rect.top() + 20.0 && pos.x >= (end_x - badge_w).max(grid_rect.left()) && pos.x <= end_x + 4.0
                 } else {
                     false
                 };
+                let is_on_end_line = if let Some(pos) = grid_resp.interact_pointer_pos() {
+                    pos.x >= end_x - 3.0 && pos.x <= end_x + 8.0
+                } else {
+                    false
+                };
+                let is_hovering_end_marker = is_on_badge || is_on_end_line;
                 if is_hovering_end_marker || is_resizing_block_now {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
@@ -3083,7 +3090,7 @@ impl JamOutApp {
                 // Mouse down: register start of note drag (move existing note OR draw new note OR resize block)
                 if grid_resp.drag_started_by(egui::PointerButton::Primary) {
                     if let Some(pos) = grid_resp.interact_pointer_pos() {
-                        let is_on_end_marker = (pos.x >= end_x - 12.0 && pos.x <= end_x + 12.0) || is_hovering_end_marker;
+                        let is_on_end_marker = is_on_badge || is_on_end_line;
                         if is_on_end_marker {
                             self.piano_roll_resizing_block = Some(block.base_length_ticks);
                             self.drag_start = None;
@@ -3092,11 +3099,11 @@ impl JamOutApp {
                             let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                             let clicked_tick = (pct_x * total_ticks as f32) as u64;
                             let shift_held = ui.input(|i| i.modifiers.shift);
+                            let snap_grid = self.note_duration_ticks.max(10);
                             let final_tick = if shift_held || self.freehand_drift {
                                 (clicked_tick as i64 + self.drag_bias_ticks).max(0) as u64
                             } else {
-                                let snapped = (clicked_tick / 240) * 240;
-                                (snapped as i64 + self.drag_bias_ticks).max(0) as u64
+                                (clicked_tick / snap_grid) * snap_grid
                             };
                             let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
                             let clicked_pitch = max_note.saturating_sub(row_idx);
@@ -3115,10 +3122,20 @@ impl JamOutApp {
                                         });
                                         let note_off_tick = note_off.map(|off| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
                                         let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-                                        let min_ticks = ((6.0 / grid_rect.width().max(1.0)) * total_ticks as f32) as u64;
-                                        let end_tick = (ev.tick + duration).max(ev.tick + min_ticks);
-                                        let tolerance = 40u64;
-                                        if clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick <= end_tick + tolerance {
+                                        let end_tick = ev.tick + duration;
+                                        let tolerance = (duration / 4).clamp(1, 15);
+                                        let is_direct_hit = clicked_tick >= ev.tick && clicked_tick < end_tick;
+                                        let is_near_hit = clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick < end_tick;
+                                        let is_hit = if is_direct_hit {
+                                            true
+                                        } else if shift_held || self.freehand_drift {
+                                            is_near_hit
+                                        } else if is_near_hit && (clicked_tick / snap_grid) == (ev.tick / snap_grid) {
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                        if is_hit {
                                             return Some((ev.id, note_off.map(|off| off.id), ev.tick, duration, note, velocity));
                                         }
                                     }
@@ -3180,10 +3197,11 @@ impl JamOutApp {
 
                             let shift_held = ui.input(|i| i.modifiers.shift);
                             let unadjusted_tick = (raw_tick as i64 - move_state.grab_offset_ticks).max(0) as u64;
+                            let snap_grid = self.note_duration_ticks.max(10);
                             let snapped_tick = if shift_held || self.freehand_drift {
                                 unadjusted_tick
                             } else {
-                                (unadjusted_tick / 240) * 240
+                                (unadjusted_tick / snap_grid) * snap_grid
                             };
                             let max_tick = block.base_length_ticks.saturating_sub(move_state.duration);
                             let clamped_tick = snapped_tick.min(max_tick);
@@ -3233,6 +3251,8 @@ impl JamOutApp {
                             let shift_held = ui.input(|i| i.modifiers.shift);
                             let is_unquantized = shift_held || self.freehand_drift;
                             let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
+                            let snap_grid = self.note_duration_ticks.max(10);
+                            let half_grid = snap_grid / 2;
                             let final_duration = if let Some(pos) = grid_resp.interact_pointer_pos() {
                                 let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                                 let current_tick = (pct_x * total_ticks as f32) as u64;
@@ -3240,7 +3260,7 @@ impl JamOutApp {
                                     let drag_len = if is_unquantized {
                                         (current_tick - start_tick).max(min_len)
                                     } else {
-                                        (((current_tick - start_tick + 120) / 240) * 240).max(min_len)
+                                        (((current_tick - start_tick + half_grid) / snap_grid) * snap_grid).max(min_len)
                                     };
                                     drag_len.min(max_len)
                                 } else {
@@ -3262,16 +3282,16 @@ impl JamOutApp {
                 } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() && self.note_move_drag.is_none() && self.piano_roll_resizing_block.is_none() {
                     // Normal single click: places note with currently selected duration
                     if let Some(pos) = grid_resp.interact_pointer_pos() {
-                        let is_on_end_marker = (pos.x >= end_x - 12.0 && pos.x <= end_x + 12.0) || is_hovering_end_marker;
+                        let is_on_end_marker = is_on_badge || (pos.x >= end_x - 2.0 && pos.x <= end_x + 8.0);
                         if !is_on_end_marker {
                             let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                             let clicked_tick = (pct_x * total_ticks as f32) as u64;
                             let shift_held = ui.input(|i| i.modifiers.shift);
+                            let snap_grid = self.note_duration_ticks.max(10);
                             let final_tick = if shift_held || self.freehand_drift {
                                 (clicked_tick as i64 + self.drag_bias_ticks).max(0) as u64
                             } else {
-                                let snapped = (clicked_tick / 240) * 240;
-                                (snapped as i64 + self.drag_bias_ticks).max(0) as u64
+                                (clicked_tick / snap_grid) * snap_grid
                             };
 
                             let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
@@ -3324,11 +3344,11 @@ impl JamOutApp {
                                     });
                                     let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
                                     let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-                                    let min_ticks = ((6.0 / grid_rect.width().max(1.0)) * total_ticks as f32) as u64;
-                                    let end_tick = (ev.tick + duration).max(ev.tick + min_ticks);
-
-                                    let tolerance = 40u64;
-                                    if clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick <= end_tick + tolerance {
+                                    let end_tick = ev.tick + duration;
+                                    let tolerance = (duration / 4).clamp(1, 15);
+                                    let is_direct_hit = clicked_tick >= ev.tick && clicked_tick < end_tick;
+                                    let is_near_hit = clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick <= end_tick + tolerance;
+                                    if is_direct_hit || is_near_hit {
                                         on_idx = Some(i);
                                         off_idx = note_off.map(|(off_i, _)| off_i);
                                         break;
@@ -3337,9 +3357,10 @@ impl JamOutApp {
                             }
                         }
 
-                        // 2. Fallback: check proximity within 120 ticks of note boundaries
+                        // 2. Fallback: check proximity scaled to note duration
                         if on_idx.is_none() {
                             let mut closest_dist = i64::MAX;
+                            let max_dist = (self.note_duration_ticks / 2).clamp(10, 60) as i64;
                             for (i, ev) in block.events.iter().enumerate() {
                                 if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
                                     if note == clicked_pitch {
@@ -3354,7 +3375,7 @@ impl JamOutApp {
                                         let start_dist = (ev.tick as i64 - clicked_tick as i64).abs();
                                         let end_dist = (note_off_tick as i64 - clicked_tick as i64).abs();
                                         let d = start_dist.min(end_dist);
-                                        if d <= 120 && d < closest_dist {
+                                        if d <= max_dist && d < closest_dist {
                                             closest_dist = d;
                                             on_idx = Some(i);
                                             off_idx = note_off.map(|(off_i, _)| off_i);
@@ -3418,22 +3439,34 @@ impl JamOutApp {
                     }
                 }
 
-                // Vertical 16th-note, Beat & Bar lines dynamically aligned to effective_ts
+                // Vertical grid lines: Bar, Beat, 16th-note, and sub-divisions (32nd/64th) when zoomed in
                 let ticks_per_bar = eff_block_ts.ticks_per_bar().max(1);
                 let ticks_per_beat = eff_block_ts.ticks_per_beat().max(1);
-                let total_16ths = (total_ticks / 240).max(1) as usize;
-                for step in 0..=total_16ths {
-                    let step_pct = step as f32 / total_16ths as f32;
+                let candidate_step = self.note_duration_ticks.clamp(10, 240);
+                let px_per_tick = grid_rect.width() / total_ticks.max(1) as f32;
+                let grid_step = if candidate_step < 240 && (px_per_tick * candidate_step as f32) >= 6.0 {
+                    candidate_step
+                } else if self.note_duration_ticks < 240 && (px_per_tick * 120.0) >= 6.0 {
+                    120
+                } else {
+                    240
+                };
+                let total_steps = (total_ticks / grid_step).max(1) as usize;
+                for step in 0..=total_steps {
+                    let tick = (step as u64) * grid_step;
+                    let step_pct = tick as f32 / total_ticks as f32;
                     let x = grid_rect.left() + grid_rect.width() * step_pct;
-                    let tick = (step as u64) * 240;
                     let is_bar = tick % ticks_per_bar == 0;
                     let is_beat = tick % ticks_per_beat == 0;
+                    let is_16th = tick % 240 == 0;
                     let (stroke_width, line_color) = if is_bar {
                         (1.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80))
                     } else if is_beat {
                         (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35))
+                    } else if is_16th {
+                        (0.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
                     } else {
-                        (0.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12))
+                        (0.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8))
                     };
                     grid_painter.line_segment(
                         [egui::pos2(x, grid_rect.top()), egui::pos2(x, grid_rect.bottom())],
@@ -3518,11 +3551,13 @@ impl JamOutApp {
                         let shift_held = ui.input(|i| i.modifiers.shift);
                         let is_unquantized = shift_held || self.freehand_drift;
                         let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
+                        let snap_grid = self.note_duration_ticks.max(10);
+                        let half_grid = snap_grid / 2;
                         let raw_len = cur_tick.saturating_sub(start_tick);
                         let drag_len = if is_unquantized {
                             raw_len.max(min_len)
                         } else {
-                            (((raw_len + 120) / 240) * 240).max(min_len)
+                            (((raw_len + half_grid) / snap_grid) * snap_grid).max(min_len)
                         };
                         let preview_len = drag_len.min(max_len);
                         if pitch >= min_note && pitch <= max_note {
