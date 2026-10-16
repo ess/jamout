@@ -1,9 +1,11 @@
+mod piano_roll;
 mod search_input;
 mod sliding_panel;
 
 use eframe::egui;
 use jamseq::ipc::{IpcCommand, IpcResponse, IpcStatusResponse, ParamType, TrackParamStatus};
 use jamseq::timeline::{LoopMode, TempoOverride, TimeSignature, TrackArrangerMode, TrackBlock};
+use piano_roll::{OpenPianoRollTarget, PianoRollAction, PianoRollState};
 use search_input::{SearchInput, SearchablePicker};
 use sliding_panel::SlidingPanelStack;
 use std::collections::HashMap;
@@ -56,19 +58,6 @@ pub struct TimelineBlockDragState {
     pub kind: BlockDragKind,
 }
 
-#[derive(Clone, Debug)]
-pub struct NoteMoveDragState {
-    pub note_on_id: u64,
-    pub note_off_id: Option<u64>,
-    pub orig_tick: u64,
-    pub orig_pitch: u8,
-    pub duration: u64,
-    pub grab_offset_ticks: i64,
-    pub velocity: f32,
-    pub current_tick: u64,
-    pub current_pitch: u8,
-}
-
 struct JamOutApp {
     _socket_path: String,
     connected: bool,
@@ -100,9 +89,7 @@ struct JamOutApp {
 
     // Piano roll state
     pub selected_track_id: String,
-    pub piano_roll_note_pitch: u8,
-    pub piano_roll_scroll_y: Option<f32>,
-    pub piano_roll_zoom_x: f32,
+    pub piano_roll: PianoRollState,
 
     // Track editing state
     pub track_name_edits: HashMap<String, String>,
@@ -116,12 +103,6 @@ struct JamOutApp {
     pub plugin_search_filter: String,
     pub insert_search_filter: String,
     pub effect_param_search_filter: String,
-
-    // Note duration and drag drawing state
-    pub note_duration_ticks: u64,
-    pub drag_start: Option<(u64, u8)>, // (start_tick, pitch)
-    pub note_move_drag: Option<NoteMoveDragState>,
-    pub piano_roll_resizing_block: Option<u64>,
 
     // Matrix Arranger & Block Editing State
     pub block_drag: Option<BlockDragState>,
@@ -138,8 +119,7 @@ struct JamOutApp {
     pub meter_dialog_den: u32,
 
     // Block-Owned Floating Piano Roll state
-    pub open_piano_roll_block: Option<(String, String)>, // (section_id, track_id)
-    pub open_piano_roll_timeline_block: Option<String>, // block_id
+    pub open_piano_roll: Option<OpenPianoRollTarget>,
     pub timeline_block_drag: Option<TimelineBlockDragState>,
 
     // Unified Section Properties Modal state
@@ -369,9 +349,7 @@ impl JamOutApp {
             show_section_dialog: false,
             new_section_name: "Verse 1".to_string(),
             selected_track_id: "bass".to_string(),
-            piano_roll_note_pitch: 50, // D3 default
-            piano_roll_scroll_y: Some(472.0), // Center on Middle C (C4) initially
-            piano_roll_zoom_x: 1.0,
+            piano_roll: PianoRollState::default(),
             track_name_edits: HashMap::new(),
             edit_track_id: None,
             edit_insert_slot: None,
@@ -381,10 +359,6 @@ impl JamOutApp {
             plugin_search_filter: String::new(),
             insert_search_filter: String::new(),
             effect_param_search_filter: String::new(),
-            note_duration_ticks: 480, // 1/8 note default
-            drag_start: None,
-            note_move_drag: None,
-            piano_roll_resizing_block: None,
             block_drag: None,
             show_tempo_dialog: None,
             tempo_dialog_mode: 0,
@@ -395,8 +369,7 @@ impl JamOutApp {
             meter_dialog_inherit: true,
             meter_dialog_num: 4,
             meter_dialog_den: 4,
-            open_piano_roll_block: None,
-            open_piano_roll_timeline_block: None,
+            open_piano_roll: None,
             timeline_block_drag: None,
             show_section_properties_modal: None,
             section_modal_name: String::new(),
@@ -1535,49 +1508,31 @@ impl eframe::App for JamOutApp {
         }
 
         // Floating Piano Roll Window for open block
-        if let Some((sec_id, track_id)) = self.open_piano_roll_block.clone() {
+        if let Some(target) = self.open_piano_roll.clone() {
             let block_exists = self.last_status.as_ref().map(|st| {
-                st.sections.iter().find(|s| s.id == sec_id)
-                    .and_then(|s| s.track_blocks.get(&track_id))
-                    .is_some()
-            }).unwrap_or(false);
-
-            if !block_exists {
-                self.open_piano_roll_block = None;
-            } else {
-                let mut is_open = true;
-                let win_title = format!("🎹 Piano Roll: Block '{}' in Section '{}'", track_id, sec_id);
-                egui::Window::new(win_title)
-                    .open(&mut is_open)
-                    .default_size([900.0, 520.0])
-                    .min_size([600.0, 350.0])
-                    .resizable(true)
-                    .collapsible(true)
-                    .show(ctx, |ui| {
-                        self.render_block_piano_roll_window(ui, &sec_id, &track_id);
-                    });
-                if !is_open {
-                    self.open_piano_roll_block = None;
+                if let Some(ref sec_id) = target.section_id {
+                    st.sections.iter().find(|s| &s.id == sec_id)
+                        .and_then(|s| s.track_blocks.get(&target.track_id))
+                        .map(|b| b.id == target.block_id)
+                        .unwrap_or(false)
+                } else {
+                    st.timeline_blocks.iter().any(|b| b.id == target.block_id && b.track_id == target.track_id)
                 }
-            }
-        }
-
-        // Floating Piano Roll Window for open timeline block
-        if let Some(block_id) = self.open_piano_roll_timeline_block.clone() {
-            let block_exists = self.last_status.as_ref().map(|st| {
-                st.timeline_blocks.iter().any(|b| b.id == block_id)
             }).unwrap_or(false);
 
             if !block_exists {
-                self.open_piano_roll_timeline_block = None;
+                self.open_piano_roll = None;
             } else {
                 let mut is_open = true;
                 let track_name = self.last_status.as_ref()
-                    .and_then(|st| st.timeline_blocks.iter().find(|b| b.id == block_id))
-                    .and_then(|b| self.last_status.as_ref().and_then(|st| st.tracks.iter().find(|t| t.id == b.track_id)))
+                    .and_then(|st| st.tracks.iter().find(|t| t.id == target.track_id))
                     .map(|t| t.name.clone())
-                    .unwrap_or_else(|| "Track".to_string());
-                let win_title = format!("🎹 Piano Roll: Clip '{}' ({})", block_id, track_name);
+                    .unwrap_or_else(|| target.track_id.clone());
+                let win_title = if let Some(ref sec_id) = target.section_id {
+                    format!("🎹 Piano Roll: Track '{}' in Section '{}'", track_name, sec_id)
+                } else {
+                    format!("🎹 Piano Roll: Clip '{}' ({})", target.block_id, track_name)
+                };
                 egui::Window::new(win_title)
                     .open(&mut is_open)
                     .default_size([900.0, 520.0])
@@ -1585,10 +1540,85 @@ impl eframe::App for JamOutApp {
                     .resizable(true)
                     .collapsible(true)
                     .show(ctx, |ui| {
-                        self.render_timeline_block_piano_roll_window(ui, &block_id);
+                        self.piano_roll.freehand_drift = self.freehand_drift;
+                        self.piano_roll.drag_bias_ticks = self.drag_bias_ticks;
+                        let mut actions = Vec::new();
+                        self.piano_roll.render(
+                            ui,
+                            &target,
+                            self.last_status.as_ref(),
+                            &self.cmd_sender,
+                            |act| actions.push(act),
+                        );
+                        for act in actions {
+                            match act {
+                                PianoRollAction::OpenMeterDialog { section_id, track_id } => {
+                                    self.show_meter_dialog = Some((section_id.clone(), track_id.clone()));
+                                    if let (Some(sec_id), Some(trk_id)) = (section_id.as_ref(), track_id.as_ref()) {
+                                        let block_opt = self.last_status.as_ref().and_then(|st| {
+                                            st.sections.iter().find(|s| &s.id == sec_id)
+                                                .and_then(|s| s.track_blocks.get(trk_id))
+                                        });
+                                        let sec_ts = self.last_status.as_ref().and_then(|st| {
+                                            st.sections.iter().find(|s| &s.id == sec_id)
+                                                .map(|s| s.effective_time_signature(st.time_signature))
+                                        }).unwrap_or(TimeSignature::default());
+
+                                        if let Some(block) = block_opt {
+                                            if let Some(ts) = block.time_signature {
+                                                self.meter_dialog_inherit = false;
+                                                self.meter_dialog_num = ts.numerator;
+                                                self.meter_dialog_den = ts.denominator;
+                                            } else {
+                                                self.meter_dialog_inherit = true;
+                                                self.meter_dialog_num = sec_ts.numerator;
+                                                self.meter_dialog_den = sec_ts.denominator;
+                                            }
+                                        }
+                                    }
+                                }
+                                PianoRollAction::OpenTempoDialog { section_id, track_id } => {
+                                    self.show_tempo_dialog = Some((section_id.clone(), track_id.clone()));
+                                    if let Some(trk_id) = track_id.as_ref() {
+                                        let block_opt = self.last_status.as_ref().and_then(|st| {
+                                            st.sections.iter().find(|s| &s.id == &section_id)
+                                                .and_then(|s| s.track_blocks.get(trk_id))
+                                        });
+                                        let sec_bpm = self.last_status.as_ref().and_then(|st| {
+                                            st.sections.iter().find(|s| &s.id == &section_id)
+                                                .map(|s| s.effective_bpm(st.bpm))
+                                        }).unwrap_or(120.0);
+                                        let eff_block_bpm = block_opt.map(|b| b.effective_bpm(sec_bpm)).unwrap_or(sec_bpm);
+
+                                        if let Some(block) = block_opt {
+                                            match block.tempo {
+                                                Some(TempoOverride::AbsoluteBpm(b)) => {
+                                                    self.tempo_dialog_mode = 1;
+                                                    self.tempo_dialog_bpm = b;
+                                                }
+                                                Some(TempoOverride::Ratio(n, d)) => {
+                                                    self.tempo_dialog_mode = 2;
+                                                    self.tempo_dialog_bpm = eff_block_bpm;
+                                                    self.tempo_dialog_num = n;
+                                                    self.tempo_dialog_den = d;
+                                                }
+                                                None => {
+                                                    self.tempo_dialog_mode = 0;
+                                                    self.tempo_dialog_bpm = sec_bpm;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                PianoRollAction::StatusMsg(msg) => {
+                                    self.status_msg = msg;
+                                    self._status_time = Instant::now();
+                                }
+                            }
+                        }
                     });
                 if !is_open {
-                    self.open_piano_roll_timeline_block = None;
+                    self.open_piano_roll = None;
                 }
             }
         }
@@ -2016,16 +2046,22 @@ impl JamOutApp {
                             if ui.small_button("🎹").on_hover_text("Open Piano Roll for this track").clicked() {
                                 if track.arranger_mode == TrackArrangerMode::Timeline {
                                     if let Some(tb) = self.last_status.as_ref().and_then(|st| st.timeline_blocks.iter().find(|b| b.track_id == track.id)) {
-                                        self.open_piano_roll_timeline_block = Some(tb.id.clone());
-                                        self.open_piano_roll_block = None;
+                                        self.open_piano_roll = Some(OpenPianoRollTarget {
+                                            track_id: track.id.clone(),
+                                            block_id: tb.id.clone(),
+                                            section_id: None,
+                                        });
                                         self.selected_track_id = track.id.clone();
                                     } else {
                                         self.status_msg = format!("Track '{}' has no timeline clips yet. Click in the timeline lane to create one.", track.name);
                                     }
                                 } else {
-                                    if let Some((s_id, _)) = sections.iter().find_map(|s| s.track_blocks.get(&track.id).map(|_| (s.id.clone(), track.id.clone()))) {
-                                        self.open_piano_roll_block = Some((s_id, track.id.clone()));
-                                        self.open_piano_roll_timeline_block = None;
+                                    if let Some((s_id, blk_id)) = sections.iter().find_map(|s| s.track_blocks.get(&track.id).map(|b| (s.id.clone(), b.id.clone()))) {
+                                        self.open_piano_roll = Some(OpenPianoRollTarget {
+                                            track_id: track.id.clone(),
+                                            block_id: blk_id,
+                                            section_id: Some(s_id),
+                                        });
                                         self.selected_track_id = track.id.clone();
                                     } else {
                                         self.status_msg = format!("Track '{}' has no blocks yet. Click '+ Add Block' in a section.", track.name);
@@ -2123,7 +2159,7 @@ impl JamOutApp {
                                 egui::vec2(bw, lane_rect.height() - 8.0),
                             );
 
-                            let is_open_in_piano_roll = self.open_piano_roll_timeline_block.as_deref() == Some(&block.id);
+                            let is_open_in_piano_roll = self.open_piano_roll.as_ref().map(|t| t.section_id.is_none() && t.block_id == block.id && t.track_id == block.track_id).unwrap_or(false);
                             let card_color = if t_idx % 3 == 0 {
                                 egui::Color32::from_rgb(35, 65, 95)
                             } else if t_idx % 3 == 1 {
@@ -2179,13 +2215,20 @@ impl JamOutApp {
 
                             if piano_resp.clicked() {
                                 self.selected_track_id = track.id.clone();
-                                self.open_piano_roll_timeline_block = Some(block.id.clone());
-                                self.open_piano_roll_block = None;
+                                self.open_piano_roll = Some(OpenPianoRollTarget {
+                                    track_id: block.track_id.clone(),
+                                    block_id: block.id.clone(),
+                                    section_id: None,
+                                });
                             }
                             if del_resp.clicked() {
-                                self.send_cmd(IpcCommand::RemoveTimelineBlock { block_id: block.id.clone() });
-                                if self.open_piano_roll_timeline_block.as_deref() == Some(&block.id) {
-                                    self.open_piano_roll_timeline_block = None;
+                                self.send_cmd(IpcCommand::RemoveBlock {
+                                    track_id: block.track_id.clone(),
+                                    block_id: block.id.clone(),
+                                    section_id: None,
+                                });
+                                if self.open_piano_roll.as_ref().map(|t| t.section_id.is_none() && t.block_id == block.id).unwrap_or(false) {
+                                    self.open_piano_roll = None;
                                 }
                             }
 
@@ -2275,18 +2318,18 @@ impl JamOutApp {
                                                 BlockDragKind::Resize => {
                                                     let new_len = (drag.initial_length_ticks as i64 + snapped_delta).max(240) as u64;
                                                     block.base_length_ticks = new_len;
-                                                    self.send_cmd(IpcCommand::SetTimelineBlock { block });
+                                                    self.send_cmd(IpcCommand::UpdateBlock { block });
                                                 }
                                                 BlockDragKind::Slip => {
                                                     for ev in &mut block.events {
                                                         ev.tick = (ev.tick as i64 + snapped_delta).max(0) as u64;
                                                     }
-                                                    self.send_cmd(IpcCommand::SetTimelineBlock { block });
+                                                    self.send_cmd(IpcCommand::UpdateBlock { block });
                                                 }
                                                 BlockDragKind::Slide => {
                                                     let new_start = (drag.initial_start_tick as i64 + snapped_delta).max(0) as u64;
                                                     block.start_offset_ticks = new_start;
-                                                    self.send_cmd(IpcCommand::SetTimelineBlock { block });
+                                                    self.send_cmd(IpcCommand::UpdateBlock { block });
                                                 }
                                             }
                                         }
@@ -2311,19 +2354,30 @@ impl JamOutApp {
                                 });
                                 if let Some(b) = hit {
                                     self.selected_track_id = track.id.clone();
-                                    self.open_piano_roll_timeline_block = Some(b.id.clone());
-                                    self.open_piano_roll_block = None;
+                                    self.open_piano_roll = Some(OpenPianoRollTarget {
+                                        track_id: b.track_id.clone(),
+                                        block_id: b.id.clone(),
+                                        section_id: None,
+                                    });
                                 } else {
                                     let click_pct = ((pos.x - lane_rect.left()) / lane_rect.width()).clamp(0.0, 1.0);
                                     let raw_tick = (click_pct * total_timeline_ticks as f32) as u64;
                                     let snap = 960u64; // Snap to nearest beat
                                     let new_start = (raw_tick / snap) * snap;
                                     let block_id = format!("{}_clip_{}", track.id, new_start);
-                                    let new_block = TrackBlock::new_timeline(&block_id, &track.id, new_start, 3840);
-                                    self.send_cmd(IpcCommand::SetTimelineBlock { block: new_block });
+                                    self.send_cmd(IpcCommand::AddBlock {
+                                        track_id: track.id.clone(),
+                                        block_id: Some(block_id.clone()),
+                                        section_id: None,
+                                        start_tick: Some(new_start),
+                                        length_ticks: Some(3840),
+                                    });
                                     self.selected_track_id = track.id.clone();
-                                    self.open_piano_roll_timeline_block = Some(block_id);
-                                    self.open_piano_roll_block = None;
+                                    self.open_piano_roll = Some(OpenPianoRollTarget {
+                                        track_id: track.id.clone(),
+                                        block_id,
+                                        section_id: None,
+                                    });
                                 }
                             }
                         }
@@ -2363,7 +2417,7 @@ impl JamOutApp {
 
                             // If track has a block inside this section:
                             if let Some(block) = sec.track_blocks.get(&track.id) {
-                                let is_open_in_piano_roll = self.open_piano_roll_block.as_ref() == Some(&(sec.id.clone(), track.id.clone()));
+                                let is_open_in_piano_roll = self.open_piano_roll.as_ref().map(|t| t.section_id.as_deref() == Some(&sec.id) && t.track_id == track.id).unwrap_or(false);
 
                                 // REAPER-style horizontal item positioning within cell
                                 let block_rect = if sec_len > 0 {
@@ -2430,15 +2484,20 @@ impl JamOutApp {
 
                                 if piano_resp.clicked() {
                                     self.selected_track_id = track.id.clone();
-                                    self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
+                                    self.open_piano_roll = Some(OpenPianoRollTarget {
+                                        track_id: track.id.clone(),
+                                        block_id: block.id.clone(),
+                                        section_id: Some(sec.id.clone()),
+                                    });
                                 }
                                 if del_resp.clicked() {
-                                    self.send_cmd(IpcCommand::RemoveTrackBlock {
-                                        section_id: sec.id.clone(),
+                                    self.send_cmd(IpcCommand::RemoveBlock {
                                         track_id: track.id.clone(),
+                                        block_id: block.id.clone(),
+                                        section_id: Some(sec.id.clone()),
                                     });
-                                    if self.open_piano_roll_block.as_ref() == Some(&(sec.id.clone(), track.id.clone())) {
-                                        self.open_piano_roll_block = None;
+                                    if self.open_piano_roll.as_ref().map(|t| t.section_id.as_deref() == Some(&sec.id) && t.track_id == track.id).unwrap_or(false) {
+                                        self.open_piano_roll = None;
                                     }
                                 }
 
@@ -2540,7 +2599,11 @@ impl JamOutApp {
                                 if !btn_hit {
                                     if cell_resp.double_clicked() {
                                         self.selected_track_id = track.id.clone();
-                                        self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
+                                        self.open_piano_roll = Some(OpenPianoRollTarget {
+                                            track_id: track.id.clone(),
+                                            block_id: block.id.clone(),
+                                            section_id: Some(sec.id.clone()),
+                                        });
                                     } else if cell_resp.clicked() {
                                         self.selected_track_id = track.id.clone();
                                     }
@@ -2589,8 +2652,7 @@ impl JamOutApp {
                                                         let new_length = (drag.initial_length as i64 + snapped_delta).max(tp_beat as i64) as u64;
                                                         let mut updated = block.clone();
                                                         updated.base_length_ticks = new_length;
-                                                        self.send_cmd(IpcCommand::SetTrackBlock {
-                                                            section_id: sec.id.clone(),
+                                                        self.send_cmd(IpcCommand::UpdateBlock {
                                                             block: updated,
                                                         });
                                                     }
@@ -2604,8 +2666,7 @@ impl JamOutApp {
                                                         for ev in &mut updated.events {
                                                             ev.tick = (ev.tick as i64 + snapped_delta).max(0) as u64;
                                                         }
-                                                        self.send_cmd(IpcCommand::SetTrackBlock {
-                                                            section_id: sec.id.clone(),
+                                                        self.send_cmd(IpcCommand::UpdateBlock {
                                                             block: updated,
                                                         });
                                                     }
@@ -2618,8 +2679,7 @@ impl JamOutApp {
                                                         let new_offset = (drag.initial_offset as i64 + snapped_delta).max(0) as u64;
                                                         let mut updated = block.clone();
                                                         updated.start_offset_ticks = new_offset;
-                                                        self.send_cmd(IpcCommand::SetTrackBlock {
-                                                            section_id: sec.id.clone(),
+                                                        self.send_cmd(IpcCommand::UpdateBlock {
                                                             block: updated,
                                                         });
                                                     }
@@ -2638,13 +2698,19 @@ impl JamOutApp {
                                 child_ui.centered_and_justified(|ui| {
                                     if ui.small_button("➕ Add Block").on_hover_text("Add a track block / pattern to this section").clicked() {
                                         let block_id = format!("{}_{}", sec.id, track.id);
-                                        let new_block = TrackBlock::new(&block_id, &track.id, 3840);
-                                        self.send_cmd(IpcCommand::SetTrackBlock {
-                                            section_id: sec.id.clone(),
-                                            block: new_block,
+                                        self.send_cmd(IpcCommand::AddBlock {
+                                            track_id: track.id.clone(),
+                                            block_id: Some(block_id.clone()),
+                                            section_id: Some(sec.id.clone()),
+                                            start_tick: None,
+                                            length_ticks: Some(sec.length_ticks),
                                         });
                                         self.selected_track_id = track.id.clone();
-                                        self.open_piano_roll_block = Some((sec.id.clone(), track.id.clone()));
+                                        self.open_piano_roll = Some(OpenPianoRollTarget {
+                                            track_id: track.id.clone(),
+                                            block_id,
+                                            section_id: Some(sec.id.clone()),
+                                        });
                                     }
                                 });
                             }
@@ -3020,1812 +3086,6 @@ impl JamOutApp {
         ui.horizontal(|ui| {
             ui.label("Save Take To:");
             ui.text_edit_singleline(&mut self.record_out_filename);
-        });
-    }
-
-    fn render_block_piano_roll_window(&mut self, ui: &mut egui::Ui, sec_id: &str, track_id: &str) {
-        let sec = match self.last_status.as_ref().and_then(|st| st.sections.iter().find(|s| s.id == sec_id)) {
-            Some(s) => s.clone(),
-            None => {
-                ui.label("Section no longer exists.");
-                return;
-            }
-        };
-
-        let track = match self.last_status.as_ref().and_then(|st| st.tracks.iter().find(|t| t.id == track_id)) {
-            Some(t) => t.clone(),
-            None => {
-                ui.label("Track no longer exists.");
-                return;
-            }
-        };
-
-        let block = match sec.track_blocks.get(track_id).cloned() {
-            Some(b) => b,
-            None => {
-                ui.label("Track block no longer exists.");
-                return;
-            }
-        };
-
-        let project_ts = self.last_status.as_ref().map(|s| s.time_signature).unwrap_or_default();
-        let project_bpm = self.last_status.as_ref().map(|s| s.bpm).unwrap_or(120.0);
-        let sec_ts = sec.time_signature.unwrap_or(project_ts);
-        let sec_bpm = sec.effective_bpm(project_bpm);
-        let eff_block_ts = block.effective_time_signature(sec_ts);
-        let is_polymeter = block.time_signature.is_some();
-        let eff_block_bpm = block.effective_bpm(sec_bpm);
-
-        // --- ROW 1: BLOCK PROPERTIES TOOLBAR ---
-        ui.horizontal(|ui| {
-            ui.strong("Block:");
-            ui.label(egui::RichText::new(&block.id).strong().color(egui::Color32::from_rgb(255, 215, 0)));
-            ui.small(format!("(Section: {}, Track: {})", sec.name, track.name));
-
-            ui.separator();
-
-            // Meter / Polymeter Button
-            let meter_text = if is_polymeter {
-                format!("⚡ {}/{} [Polymeter]", eff_block_ts.numerator, eff_block_ts.denominator)
-            } else {
-                format!("📏 {}/{}", eff_block_ts.numerator, eff_block_ts.denominator)
-            };
-            let meter_color = if is_polymeter {
-                egui::Color32::from_rgb(140, 50, 160)
-            } else {
-                egui::Color32::from_rgb(45, 55, 70)
-            };
-            if ui.add(egui::Button::new(egui::RichText::new(meter_text).small()).fill(meter_color))
-                .on_hover_text("Configure block meter or independent polymeter")
-                .clicked()
-            {
-                self.show_meter_dialog = Some((Some(sec_id.to_string()), Some(track_id.to_string())));
-                if let Some(ts) = block.time_signature {
-                    self.meter_dialog_inherit = false;
-                    self.meter_dialog_num = ts.numerator;
-                    self.meter_dialog_den = ts.denominator;
-                } else {
-                    self.meter_dialog_inherit = true;
-                    self.meter_dialog_num = sec_ts.numerator;
-                    self.meter_dialog_den = sec_ts.denominator;
-                }
-            }
-
-            // Tempo / Polytempo Button
-            let tempo_text = match block.tempo {
-                Some(TempoOverride::AbsoluteBpm(b)) => format!("⏱ {:.1} BPM", b),
-                Some(TempoOverride::Ratio(n, d)) => format!("⏱ {}:{} ({:.1} BPM)", n, d, eff_block_bpm),
-                None => format!("⏱ {:.1} BPM", eff_block_bpm),
-            };
-            let tempo_color = match block.tempo {
-                Some(TempoOverride::Ratio(_, _)) => egui::Color32::from_rgb(180, 100, 30),
-                Some(TempoOverride::AbsoluteBpm(_)) => egui::Color32::from_rgb(30, 90, 160),
-                None => egui::Color32::from_rgb(45, 55, 70),
-            };
-            if ui.add(egui::Button::new(egui::RichText::new(tempo_text).small()).fill(tempo_color))
-                .on_hover_text("Configure block tempo or metric modulation ratio")
-                .clicked()
-            {
-                self.show_tempo_dialog = Some((sec_id.to_string(), Some(track_id.to_string())));
-                match block.tempo {
-                    Some(TempoOverride::AbsoluteBpm(b)) => {
-                        self.tempo_dialog_mode = 1;
-                        self.tempo_dialog_bpm = b;
-                    }
-                    Some(TempoOverride::Ratio(n, d)) => {
-                        self.tempo_dialog_mode = 2;
-                        self.tempo_dialog_bpm = eff_block_bpm;
-                        self.tempo_dialog_num = n;
-                        self.tempo_dialog_den = d;
-                    }
-                    None => {
-                        self.tempo_dialog_mode = 0;
-                        self.tempo_dialog_bpm = sec_bpm;
-                    }
-                }
-            }
-
-            ui.separator();
-
-            // Loop Mode
-            ui.label("Loop:");
-            let loop_label = match block.loop_mode {
-                LoopMode::OneShot => "One-Shot (1x)",
-                LoopMode::FixedLoops(2) => "Repeat 2x",
-                LoopMode::FixedLoops(4) => "Repeat 4x",
-                LoopMode::LoopToSection => "Loop to Section",
-                LoopMode::FixedLoops(_) => "Custom Loop",
-            };
-            egui::ComboBox::from_id_salt(format!("blk_loop_combo_{}_{}", sec_id, track_id))
-                .selected_text(loop_label)
-                .show_ui(ui, |ui| {
-                    if ui.selectable_label(block.loop_mode == LoopMode::OneShot, "One-Shot (1x)").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::OneShot;
-                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                    }
-                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(2), "Repeat 2x").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::FixedLoops(2);
-                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                    }
-                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(4), "Repeat 4x").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::FixedLoops(4);
-                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                    }
-                    if ui.selectable_label(block.loop_mode == LoopMode::LoopToSection, "Loop to Section").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::LoopToSection;
-                        self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                    }
-                });
-
-            ui.separator();
-
-            // Base Length in Bars & Beats (supports fractional bars)
-            let tpb = eff_block_ts.ticks_per_bar().max(1);
-            let tp_beat = eff_block_ts.ticks_per_beat().max(1);
-            let current_bars = (block.base_length_ticks / tpb) as u32;
-            let current_rem_ticks = block.base_length_ticks % tpb;
-            let current_beats = (current_rem_ticks / tp_beat) as u32;
-
-            ui.label("Length:");
-            ui.label("Bars:");
-            let mut edit_bars = current_bars;
-            if ui.add(egui::DragValue::new(&mut edit_bars).range(0..=128)).changed() {
-                let new_len = (edit_bars as u64 * tpb + current_beats as u64 * tp_beat).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-            }
-
-            ui.label("Beats:");
-            let mut edit_beats = current_beats;
-            let max_beats = (eff_block_ts.numerator.saturating_sub(1)).max(1);
-            if ui.add(egui::DragValue::new(&mut edit_beats).range(0..=max_beats)).changed() {
-                let new_len = (current_bars as u64 * tpb + edit_beats as u64 * tp_beat).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-            }
-
-            if ui.small_button("-1 Beat").on_hover_text("Shorten block by 1 beat").clicked() {
-                let new_len = block.base_length_ticks.saturating_sub(tp_beat).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-            }
-            if ui.small_button("+1 Beat").on_hover_text("Lengthen block by 1 beat").clicked() {
-                let new_len = block.base_length_ticks + tp_beat;
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-            }
-            if ui.small_button("-1 Bar").on_hover_text("Shorten block by 1 bar").clicked() {
-                let new_len = block.base_length_ticks.saturating_sub(tpb).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-            }
-            if ui.small_button("+1 Bar").on_hover_text("Lengthen block by 1 bar").clicked() {
-                let new_len = block.base_length_ticks + tpb;
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-            }
-
-            let frac_bars = block.base_length_ticks as f64 / tpb as f64;
-            ui.small(egui::RichText::new(format!("({:.2} bars)", frac_bars)).color(egui::Color32::from_rgb(180, 210, 255)));
-        });
-
-        ui.add_space(3.0);
-
-        // 8 Full Octaves displayed (C0 = 12 to C8 = 108)
-        let min_note = 12u8; // C0
-        let max_note = 108u8; // C8
-        let num_notes = (max_note - min_note + 1) as usize;
-        let row_height = 14.0f32;
-
-        // --- ROW 2: NOTE TOOLS & OCTAVE NAVIGATION TOOLBAR ---
-        ui.horizontal(|ui| {
-            ui.label("Length:");
-            let durations = [
-                (60u64, "1/64"),
-                (120u64, "1/32"),
-                (240u64, "1/16"),
-                (480u64, "1/8"),
-                (960u64, "1/4"),
-                (1920u64, "1/2"),
-                (3840u64, "1 Bar"),
-            ];
-            for (dur, label) in durations {
-                if ui.selectable_label(self.note_duration_ticks == dur, label).clicked() {
-                    self.note_duration_ticks = dur;
-                }
-            }
-
-            ui.separator();
-            ui.label("Pitch:");
-            let note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-            let octave = (self.piano_roll_note_pitch / 12) as i32 - 1;
-            let note_idx = (self.piano_roll_note_pitch % 12) as usize;
-            ui.strong(format!("{}{}", note_names[note_idx], octave));
-
-            ui.separator();
-            ui.label("Jump:");
-            if ui.small_button("C1").clicked() { self.piano_roll_scroll_y = Some(((max_note - 24) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C2").clicked() { self.piano_roll_scroll_y = Some(((max_note - 36) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C3").clicked() { self.piano_roll_scroll_y = Some(((max_note - 48) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C4").clicked() { self.piano_roll_scroll_y = Some(((max_note - 60) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C5").clicked() { self.piano_roll_scroll_y = Some(((max_note - 72) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C6").clicked() { self.piano_roll_scroll_y = Some(((max_note - 84) as f32 * row_height - 180.0).max(0.0)); }
-
-            ui.separator();
-            let pitches: Vec<u8> = block.events.iter().filter_map(|e| {
-                if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = e.action {
-                    Some(note)
-                } else {
-                    None
-                }
-            }).collect();
-
-            if ui.small_button("🎯 Focus Notes").clicked() {
-                if !pitches.is_empty() {
-                    let avg = pitches.iter().map(|&p| p as f32).sum::<f32>() / pitches.len() as f32;
-                    self.piano_roll_scroll_y = Some(((max_note as f32 - avg) * row_height - 180.0).max(0.0));
-                } else {
-                    self.piano_roll_scroll_y = Some(((max_note - 60) as f32 * row_height - 180.0).max(0.0));
-                }
-            }
-
-            ui.separator();
-            ui.label("Zoom:");
-            if ui.small_button("➖").on_hover_text("Zoom out (Ctrl + Wheel Down)").clicked() {
-                self.piano_roll_zoom_x = (self.piano_roll_zoom_x / 1.25).max(0.25);
-            }
-            let zoom_pct = (self.piano_roll_zoom_x * 100.0).round() as i32;
-            if ui.small_button(format!("{}%", zoom_pct)).on_hover_text("Click to reset zoom to 100%").clicked() {
-                self.piano_roll_zoom_x = 1.0;
-            }
-            if ui.small_button("➕").on_hover_text("Zoom in (Ctrl + Wheel Up)").clicked() {
-                self.piano_roll_zoom_x = (self.piano_roll_zoom_x * 1.25).min(8.0);
-            }
-        });
-
-        ui.add_space(4.0);
-
-        let (zoom_delta, ctrl_held) = ui.input(|i| {
-            let ctrl = i.modifiers.ctrl || i.modifiers.command;
-            let factor = if i.zoom_delta() != 1.0 {
-                i.zoom_delta()
-            } else if ctrl && i.raw_scroll_delta.y != 0.0 {
-                if i.raw_scroll_delta.y > 0.0 { 1.15 } else { 1.0 / 1.15 }
-            } else {
-                1.0
-            };
-            (factor, ctrl)
-        });
-
-        if zoom_delta != 1.0 {
-            self.piano_roll_zoom_x = (self.piano_roll_zoom_x * zoom_delta).clamp(0.25, 8.0);
-        }
-
-        let tpb = eff_block_ts.ticks_per_bar().max(1);
-        let tp_beat = eff_block_ts.ticks_per_beat().max(1);
-        let headroom = tpb.max(tp_beat * 2);
-        let view_ticks = block.base_length_ticks + headroom;
-        let total_ticks = view_ticks;
-        let track_events = block.events.clone();
-
-        let mut v_scroll = egui::ScrollArea::vertical()
-            .id_salt("piano_roll_v_scroll")
-            .enable_scrolling(!ctrl_held);
-        if let Some(offset_y) = self.piano_roll_scroll_y.take() {
-            v_scroll = v_scroll.vertical_scroll_offset(offset_y);
-        }
-
-        v_scroll.show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Left Keyboard Column (Piano Keys) - Pinned
-                let keyboard_width = 54.0;
-                let (key_rect, key_resp) = ui.allocate_exact_size(
-                    egui::vec2(keyboard_width, num_notes as f32 * row_height),
-                    egui::Sense::click(),
-                );
-
-                let hovered_pitch = ui.input(|i| i.pointer.hover_pos()).and_then(|pos| {
-                    if pos.y >= key_rect.top() && pos.y < key_rect.top() + num_notes as f32 * row_height {
-                        let row_idx = ((pos.y - key_rect.top()) / row_height).floor() as u8;
-                        if (row_idx as usize) < num_notes {
-                            Some(max_note.saturating_sub(row_idx))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-
-                if key_resp.clicked() {
-                    if let Some(pos) = key_resp.interact_pointer_pos() {
-                        let row_idx = ((pos.y - key_rect.top()) / row_height).floor() as u8;
-                        let clicked_pitch = max_note.saturating_sub(row_idx);
-                        self.piano_roll_note_pitch = clicked_pitch;
-                    }
-                }
-
-                let key_painter = ui.painter();
-                let note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-
-                for i in 0..num_notes {
-                    let pitch = max_note - i as u8;
-                    let y = key_rect.top() + i as f32 * row_height;
-                    let r = egui::Rect::from_min_size(egui::pos2(key_rect.left(), y), egui::vec2(keyboard_width, row_height));
-
-                    let is_c = pitch % 12 == 0;
-                    let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
-                    let is_active_pitch = pitch == self.piano_roll_note_pitch;
-                    let is_hovered = hovered_pitch == Some(pitch);
-
-                    let key_bg = if is_active_pitch {
-                        egui::Color32::from_rgb(65, 130, 220)
-                    } else if is_hovered {
-                        if is_black { egui::Color32::from_rgb(50, 58, 75) } else { egui::Color32::from_rgb(255, 255, 190) }
-                    } else if is_c {
-                        egui::Color32::from_rgb(240, 240, 252)
-                    } else if is_black {
-                        egui::Color32::from_rgb(28, 28, 34)
-                    } else {
-                        egui::Color32::from_rgb(215, 215, 222)
-                    };
-                    key_painter.rect_filled(r, 1.0, key_bg);
-
-                    if is_c {
-                        key_painter.line_segment(
-                            [egui::pos2(r.left(), r.bottom()), egui::pos2(r.right(), r.bottom())],
-                            egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 140, 240)),
-                        );
-                    }
-
-                    let name = note_names[(pitch % 12) as usize];
-                    let oct = (pitch / 12) as i32 - 1;
-                    let text_color = if is_active_pitch {
-                        egui::Color32::WHITE
-                    } else if is_hovered {
-                        if is_black { egui::Color32::WHITE } else { egui::Color32::from_rgb(20, 20, 50) }
-                    } else if is_black {
-                        egui::Color32::LIGHT_GRAY
-                    } else if is_c {
-                        egui::Color32::from_rgb(15, 45, 130)
-                    } else {
-                        egui::Color32::BLACK
-                    };
-                    key_painter.text(
-                        egui::pos2(r.left() + 4.0, r.top() + 1.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{}{}", name, oct),
-                        egui::FontId::proportional(if is_c { 10.5 } else { 9.5 }),
-                        text_color,
-                    );
-                }
-
-                // Main Note Grid Canvas (wrapped in horizontal ScrollArea for independent horizontal zoom & scrolling)
-                egui::ScrollArea::horizontal()
-                    .id_salt("piano_roll_h_scroll")
-                    .show(ui, |ui| {
-                        let avail_w = (ui.available_width() - 20.0).max(650.0);
-                        let grid_width = (avail_w * self.piano_roll_zoom_x).max(200.0);
-                        let (grid_rect, grid_resp) = ui.allocate_exact_size(
-                            egui::vec2(grid_width, num_notes as f32 * row_height),
-                            egui::Sense::click_and_drag(),
-                        );
-
-                        let end_pct = (block.base_length_ticks as f32 / view_ticks as f32).clamp(0.0, 1.0);
-                let end_x = grid_rect.left() + end_pct * grid_rect.width();
-
-                let is_resizing_block_now = self.piano_roll_resizing_block.is_some();
-                let badge_w = 62.0;
-                let badge_h = 18.0;
-                let visible_center_y = ui.clip_rect().center().y.clamp(grid_rect.top() + badge_h, grid_rect.bottom() - badge_h);
-                let badge_rect = egui::Rect::from_min_size(
-                    egui::pos2(end_x + 2.0, visible_center_y - badge_h / 2.0),
-                    egui::vec2(badge_w, badge_h),
-                );
-                let is_hovering_badge = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                    badge_rect.contains(pos)
-                } else {
-                    false
-                };
-                if is_hovering_badge || is_resizing_block_now {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
-
-                // Mouse down: register start of note drag (move existing note OR draw new note OR resize block)
-                if grid_resp.drag_started_by(egui::PointerButton::Primary) {
-                    if is_hovering_badge {
-                        self.piano_roll_resizing_block = Some(block.base_length_ticks);
-                        self.drag_start = None;
-                        self.note_move_drag = None;
-                    } else if let Some(pos) = grid_resp.interact_pointer_pos() {
-                            let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                            let clicked_tick = (pct_x * total_ticks as f32) as u64;
-                            let shift_held = ui.input(|i| i.modifiers.shift);
-                            let snap_grid = self.note_duration_ticks.max(10);
-                            let final_tick = if shift_held || self.freehand_drift {
-                                (clicked_tick as i64 + self.drag_bias_ticks).max(0) as u64
-                            } else {
-                                (clicked_tick / snap_grid) * snap_grid
-                            };
-                            let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
-                            let clicked_pitch = max_note.saturating_sub(row_idx);
-                            self.piano_roll_note_pitch = clicked_pitch;
-
-                            // Check if an existing note on clicked_pitch was clicked:
-                            let clicked_note = block.events.iter().enumerate().find_map(|(i, ev)| {
-                                if let jamseq::timeline::ScheduledAction::NoteOn { note, velocity } = ev.action {
-                                    if note == clicked_pitch {
-                                        let note_off = block.events.iter().skip(i + 1).find(|off_ev| {
-                                            off_ev.tick > ev.tick
-                                                && match off_ev.action {
-                                                    jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                    _ => false,
-                                                }
-                                        });
-                                        let note_off_tick = note_off.map(|off| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                        let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-                                        let end_tick = ev.tick + duration;
-                                        let tolerance = (duration / 4).clamp(1, 15);
-                                        let is_direct_hit = clicked_tick >= ev.tick && clicked_tick < end_tick;
-                                        let is_near_hit = clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick < end_tick;
-                                        let is_hit = if is_direct_hit {
-                                            true
-                                        } else if shift_held || self.freehand_drift {
-                                            is_near_hit
-                                        } else if is_near_hit && (clicked_tick / snap_grid) == (ev.tick / snap_grid) {
-                                            true
-                                        } else {
-                                            false
-                                        };
-                                        if is_hit {
-                                            return Some((ev.id, note_off.map(|off| off.id), ev.tick, duration, note, velocity));
-                                        }
-                                    }
-                                }
-                                None
-                            });
-
-                            if let Some((on_id, off_id, orig_tick, duration, orig_pitch, velocity)) = clicked_note {
-                                // User clicked an existing note -> start moving it!
-                                let grab_offset = clicked_tick as i64 - orig_tick as i64;
-                                self.note_move_drag = Some(NoteMoveDragState {
-                                    note_on_id: on_id,
-                                    note_off_id: off_id,
-                                    orig_tick,
-                                    orig_pitch,
-                                    duration,
-                                    grab_offset_ticks: grab_offset,
-                                    velocity,
-                                    current_tick: orig_tick,
-                                    current_pitch: orig_pitch,
-                                });
-                                self.drag_start = None;
-                            } else {
-                                // Dragging on empty space inside block -> draw new note mode
-                                self.note_move_drag = None;
-                                if final_tick < block.base_length_ticks && !block.has_note_at(clicked_pitch, clicked_tick) && !block.has_note_at(clicked_pitch, final_tick) {
-                                    self.drag_start = Some((final_tick, clicked_pitch));
-                                } else {
-                                    self.drag_start = None;
-                                }
-                            }
-                        }
-                    }
-
-
-                // Dragging in progress: update moving note position OR resizing block
-                if grid_resp.dragged() {
-                    if let Some(_initial_len) = self.piano_roll_resizing_block {
-                        if let Some(pos) = grid_resp.interact_pointer_pos() {
-                            let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.02, 1.0);
-                            let raw_tick = (pct_x * view_ticks as f32) as u64;
-                            let shift_held = ui.input(|i| i.modifiers.shift);
-                            let snapped_tick = if shift_held || self.freehand_drift {
-                                raw_tick
-                            } else {
-                                ((raw_tick + tp_beat / 2) / tp_beat) * tp_beat
-                            };
-                            let new_len = snapped_tick.max(tp_beat);
-                            let mut updated = block.clone();
-                            updated.base_length_ticks = new_len;
-                            self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                        }
-                    } else if let Some(ref mut move_state) = self.note_move_drag {
-                        if let Some(pos) = grid_resp.interact_pointer_pos() {
-                            let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                            let raw_tick = (pct_x * total_ticks as f32) as u64;
-                            let row_idx = ((pos.y - grid_rect.top()) / row_height).floor().clamp(0.0, (num_notes.saturating_sub(1)) as f32) as u8;
-                            let new_pitch = max_note.saturating_sub(row_idx);
-
-                            let shift_held = ui.input(|i| i.modifiers.shift);
-                            let unadjusted_tick = (raw_tick as i64 - move_state.grab_offset_ticks).max(0) as u64;
-                            let snap_grid = self.note_duration_ticks.max(10);
-                            let snapped_tick = if shift_held || self.freehand_drift {
-                                unadjusted_tick
-                            } else {
-                                (unadjusted_tick / snap_grid) * snap_grid
-                            };
-                            let max_tick = block.base_length_ticks.saturating_sub(move_state.duration);
-                            let clamped_tick = snapped_tick.min(max_tick);
-
-                            move_state.current_tick = clamped_tick;
-                            move_state.current_pitch = new_pitch;
-                        }
-                    }
-                }
-
-                // Mouse release: commit moved note or drawn note
-                if grid_resp.drag_stopped_by(egui::PointerButton::Primary) {
-                    if self.piano_roll_resizing_block.is_some() {
-                        self.piano_roll_resizing_block = None;
-                    } else if let Some(move_state) = self.note_move_drag.take() {
-                        if move_state.current_tick != move_state.orig_tick || move_state.current_pitch != move_state.orig_pitch {
-                            let mut updated = block.clone();
-                            // Remove original note
-                            updated.events.retain(|e| {
-                                e.id != move_state.note_on_id && Some(e.id) != move_state.note_off_id
-                            });
-
-                            if updated.has_note_at(move_state.current_pitch, move_state.current_tick) {
-                                self.status_msg = format!("Cannot move: pitch {} is already occupied at tick {}", move_state.current_pitch, move_state.current_tick);
-                            } else {
-                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                updated.add_note(
-                                    now_ms,
-                                    now_ms + 1,
-                                    move_state.current_tick,
-                                    move_state.duration,
-                                    move_state.current_pitch,
-                                    move_state.velocity,
-                                );
-                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                                self.piano_roll_note_pitch = move_state.current_pitch;
-                                self.status_msg = format!("Block '{}': Moved note to pitch {} at tick {}", block.id, move_state.current_pitch, move_state.current_tick);
-                            }
-                        }
-                    } else if let Some((start_tick, pitch)) = self.drag_start.take() {
-                        if !block.has_note_at(pitch, start_tick) {
-                            let max_len = if let Some(next_start) = block.next_note_start(pitch, start_tick) {
-                                next_start.saturating_sub(start_tick)
-                            } else {
-                                block.base_length_ticks.saturating_sub(start_tick)
-                            };
-                            let shift_held = ui.input(|i| i.modifiers.shift);
-                            let is_unquantized = shift_held || self.freehand_drift;
-                            let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
-                            let snap_grid = self.note_duration_ticks.max(10);
-                            let half_grid = snap_grid / 2;
-                            let final_duration = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                                let current_tick = (pct_x * total_ticks as f32) as u64;
-                                if current_tick > start_tick {
-                                    let drag_len = if is_unquantized {
-                                        (current_tick - start_tick).max(min_len)
-                                    } else {
-                                        (((current_tick - start_tick + half_grid) / snap_grid) * snap_grid).max(min_len)
-                                    };
-                                    drag_len.min(max_len)
-                                } else {
-                                    self.note_duration_ticks.min(max_len)
-                                }
-                            } else {
-                                self.note_duration_ticks.min(max_len)
-                            };
-
-                            if final_duration > 0 {
-                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                let mut updated = block.clone();
-                                updated.add_note(now_ms, now_ms + 1, start_tick, final_duration, pitch, 0.9);
-                                self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                                self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", block.id, pitch, start_tick, final_duration);
-                            }
-                        }
-                    }
-                } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() && self.note_move_drag.is_none() && self.piano_roll_resizing_block.is_none() {
-                    // Normal single click: places note with currently selected duration
-                    if let Some(pos) = grid_resp.interact_pointer_pos() {
-                        if !is_hovering_badge {
-                            let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                            let clicked_tick = (pct_x * total_ticks as f32) as u64;
-                            let shift_held = ui.input(|i| i.modifiers.shift);
-                            let snap_grid = self.note_duration_ticks.max(10);
-                            let final_tick = if shift_held || self.freehand_drift {
-                                (clicked_tick as i64 + self.drag_bias_ticks).max(0) as u64
-                            } else {
-                                (clicked_tick / snap_grid) * snap_grid
-                            };
-
-                            let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
-                            let clicked_pitch = max_note.saturating_sub(row_idx);
-                            self.piano_roll_note_pitch = clicked_pitch;
-
-                            // Check if clicked position or final_tick is inside an existing note or outside block
-                            if final_tick >= block.base_length_ticks {
-                                self.status_msg = format!("Cannot place note past block end (tick {})", block.base_length_ticks);
-                            } else if block.has_note_at(clicked_pitch, clicked_tick) || block.has_note_at(clicked_pitch, final_tick) {
-                                self.status_msg = format!("Block '{}': Note already exists on pitch {} at tick {}", block.id, clicked_pitch, clicked_tick);
-                            } else {
-                                let max_len = if let Some(next_start) = block.next_note_start(clicked_pitch, final_tick) {
-                                    next_start.saturating_sub(final_tick)
-                                } else {
-                                    block.base_length_ticks.saturating_sub(final_tick)
-                                };
-                                let final_duration = self.note_duration_ticks.min(max_len);
-                                if final_duration > 0 {
-                                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                    let mut updated = block.clone();
-                                    updated.add_note(now_ms, now_ms + 1, final_tick, final_duration, clicked_pitch, 0.9);
-                                    self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                                    self.status_msg = format!("Block '{}': Added note {} at tick {} (length: {} ticks)", block.id, clicked_pitch, final_tick, final_duration);
-                                }
-                            }
-                        }
-                    }
-                } else if grid_resp.secondary_clicked() {
-                    // Right click deletes note anywhere along its duration
-                    if let Some(pos) = grid_resp.interact_pointer_pos() {
-                        let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                        let clicked_tick = (pct_x * total_ticks as f32) as u64;
-                        let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
-                        let clicked_pitch = max_note.saturating_sub(row_idx);
-
-                        let mut on_idx = None;
-                        let mut off_idx = None;
-
-                        // 1. Check if clicked_tick falls within any note's [start, end] span
-                        for (i, ev) in block.events.iter().enumerate() {
-                            if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
-                                if note == clicked_pitch {
-                                    let note_off = block.events.iter().enumerate().skip(i + 1).find(|(_, off_ev)| {
-                                        off_ev.tick > ev.tick
-                                            && match off_ev.action {
-                                                jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                _ => false,
-                                            }
-                                    });
-                                    let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                    let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-                                    let end_tick = ev.tick + duration;
-                                    let tolerance = (duration / 4).clamp(1, 15);
-                                    let is_direct_hit = clicked_tick >= ev.tick && clicked_tick < end_tick;
-                                    let is_near_hit = clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick <= end_tick + tolerance;
-                                    if is_direct_hit || is_near_hit {
-                                        on_idx = Some(i);
-                                        off_idx = note_off.map(|(off_i, _)| off_i);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        // 2. Fallback: check proximity scaled to note duration
-                        if on_idx.is_none() {
-                            let mut closest_dist = i64::MAX;
-                            let max_dist = (self.note_duration_ticks / 2).clamp(10, 60) as i64;
-                            for (i, ev) in block.events.iter().enumerate() {
-                                if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
-                                    if note == clicked_pitch {
-                                        let note_off = block.events.iter().enumerate().skip(i + 1).find(|(_, off_ev)| {
-                                            off_ev.tick > ev.tick
-                                                && match off_ev.action {
-                                                jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                _ => false,
-                                            }
-                                        });
-                                        let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                        let start_dist = (ev.tick as i64 - clicked_tick as i64).abs();
-                                        let end_dist = (note_off_tick as i64 - clicked_tick as i64).abs();
-                                        let d = start_dist.min(end_dist);
-                                        if d <= max_dist && d < closest_dist {
-                                            closest_dist = d;
-                                            on_idx = Some(i);
-                                            off_idx = note_off.map(|(off_i, _)| off_i);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Remove both NoteOn and corresponding NoteOff
-                        if let Some(on_i) = on_idx {
-                            let mut updated = block.clone();
-                            let mut indices_to_remove = vec![on_i];
-                            if let Some(off_i) = off_idx {
-                                indices_to_remove.push(off_i);
-                            }
-                            indices_to_remove.sort_unstable_by(|a, b| b.cmp(a));
-                            for idx in indices_to_remove {
-                                if idx < updated.events.len() {
-                                    updated.events.remove(idx);
-                                }
-                            }
-                            self.send_cmd(IpcCommand::SetTrackBlock { section_id: sec_id.to_string(), block: updated });
-                            self.status_msg = format!("Block '{}': Deleted note {} at tick {}", block.id, clicked_pitch, clicked_tick);
-                        }
-                    }
-                }
-
-                let grid_painter = ui.painter();
-                // Grid background rows
-                for i in 0..num_notes {
-                    let pitch = max_note - i as u8;
-                    let y = grid_rect.top() + i as f32 * row_height;
-                    let r = egui::Rect::from_min_size(egui::pos2(grid_rect.left(), y), egui::vec2(grid_width, row_height));
-                    let is_c = pitch % 12 == 0;
-                    let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
-                    let is_hovered = hovered_pitch == Some(pitch);
-
-                    let row_bg = if is_hovered {
-                        if is_black { egui::Color32::from_rgb(36, 40, 52) } else { egui::Color32::from_rgb(46, 52, 66) }
-                    } else if is_black {
-                        egui::Color32::from_rgb(22, 22, 28)
-                    } else {
-                        egui::Color32::from_rgb(32, 32, 38)
-                    };
-                    grid_painter.rect_filled(r, 0.0, row_bg);
-
-                    if is_hovered {
-                        grid_painter.rect_stroke(
-                            r,
-                            0.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 160, 255, 60)),
-                        );
-                    }
-
-                    if is_c {
-                        grid_painter.line_segment(
-                            [egui::pos2(grid_rect.left(), r.bottom()), egui::pos2(grid_rect.right(), r.bottom())],
-                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 140, 240, 50)),
-                        );
-                    }
-                }
-
-                // Vertical grid lines: Bar, Beat, 16th-note, and sub-divisions (32nd/64th) when zoomed in
-                let ticks_per_bar = eff_block_ts.ticks_per_bar().max(1);
-                let ticks_per_beat = eff_block_ts.ticks_per_beat().max(1);
-                let candidate_step = self.note_duration_ticks.clamp(10, 240);
-                let px_per_tick = grid_rect.width() / total_ticks.max(1) as f32;
-                let grid_step = if candidate_step < 240 && (px_per_tick * candidate_step as f32) >= 6.0 {
-                    candidate_step
-                } else if self.note_duration_ticks < 240 && (px_per_tick * 120.0) >= 6.0 {
-                    120
-                } else {
-                    240
-                };
-                let total_steps = (total_ticks / grid_step).max(1) as usize;
-                for step in 0..=total_steps {
-                    let tick = (step as u64) * grid_step;
-                    let step_pct = tick as f32 / total_ticks as f32;
-                    let x = grid_rect.left() + grid_rect.width() * step_pct;
-                    let is_bar = tick % ticks_per_bar == 0;
-                    let is_beat = tick % ticks_per_beat == 0;
-                    let is_16th = tick % 240 == 0;
-                    let (stroke_width, line_color) = if is_bar {
-                        (1.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80))
-                    } else if is_beat {
-                        (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35))
-                    } else if is_16th {
-                        (0.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
-                    } else {
-                        (0.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8))
-                    };
-                    grid_painter.line_segment(
-                        [egui::pos2(x, grid_rect.top()), egui::pos2(x, grid_rect.bottom())],
-                        egui::Stroke::new(stroke_width, line_color),
-                    );
-                }
-
-                // Draw Note Blocks with true duration
-                for ev in &track_events {
-                    if let jamseq::timeline::ScheduledAction::NoteOn { note, velocity: _ } = ev.action {
-                        if note >= min_note && note <= max_note && total_ticks > 0 {
-                            // Find matching NoteOff tick
-                            let note_off_tick = track_events
-                                .iter()
-                                .find(|off_ev| {
-                                    off_ev.tick > ev.tick
-                                        && match off_ev.action {
-                                            jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                            _ => false,
-                                        }
-                                })
-                                .map(|off_ev| off_ev.tick)
-                                .unwrap_or(ev.tick + self.note_duration_ticks);
-
-                            let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-
-                            let row = (max_note - note) as f32;
-                            let y = grid_rect.top() + row * row_height;
-                            let note_pct = (ev.tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                            let note_x = grid_rect.left() + grid_rect.width() * note_pct;
-                            let note_w = (grid_rect.width() * (duration as f32 / total_ticks as f32)).max(6.0);
-                            let n_rect = egui::Rect::from_min_size(
-                                egui::pos2(note_x, y + 1.0),
-                                egui::vec2(note_w, row_height - 2.0),
-                            );
-
-                            let is_being_moved = self.note_move_drag.as_ref().map(|d| d.note_on_id == ev.id).unwrap_or(false);
-                            let fill_color = if is_being_moved {
-                                egui::Color32::from_rgba_unmultiplied(90, 190, 255, 50)
-                            } else {
-                                egui::Color32::from_rgb(90, 190, 255)
-                            };
-                            let stroke = if is_being_moved {
-                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50))
-                            } else {
-                                egui::Stroke::new(1.0, egui::Color32::WHITE)
-                            };
-
-                            grid_painter.rect_filled(n_rect, 2.0, fill_color);
-                            grid_painter.rect_stroke(n_rect, 2.0, stroke);
-                        }
-                    }
-                }
-
-                // Draw ghost preview for note being moved
-                if let Some(ref move_state) = self.note_move_drag {
-                    if move_state.current_pitch >= min_note && move_state.current_pitch <= max_note && total_ticks > 0 {
-                        let row = (max_note - move_state.current_pitch) as f32;
-                        let y = grid_rect.top() + row * row_height;
-                        let note_pct = (move_state.current_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                        let note_x = grid_rect.left() + grid_rect.width() * note_pct;
-                        let note_w = (grid_rect.width() * (move_state.duration as f32 / total_ticks as f32)).max(6.0);
-                        let move_rect = egui::Rect::from_min_size(
-                            egui::pos2(note_x, y + 1.0),
-                            egui::vec2(note_w, row_height - 2.0),
-                        );
-                        grid_painter.rect_filled(move_rect, 2.0, egui::Color32::from_rgba_unmultiplied(100, 220, 255, 180));
-                        grid_painter.rect_stroke(move_rect, 2.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 255, 120)));
-                    }
-                }
-
-                // Draw ghost note preview while dragging to lengthen
-                if let Some((start_tick, pitch)) = self.drag_start {
-                    if let Some(pos) = grid_resp.interact_pointer_pos() {
-                        let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                        let cur_tick = (pct_x * total_ticks as f32) as u64;
-                        let max_len = if let Some(next_start) = block.next_note_start(pitch, start_tick) {
-                            next_start.saturating_sub(start_tick)
-                        } else {
-                            u64::MAX
-                        };
-                        let shift_held = ui.input(|i| i.modifiers.shift);
-                        let is_unquantized = shift_held || self.freehand_drift;
-                        let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
-                        let snap_grid = self.note_duration_ticks.max(10);
-                        let half_grid = snap_grid / 2;
-                        let raw_len = cur_tick.saturating_sub(start_tick);
-                        let drag_len = if is_unquantized {
-                            raw_len.max(min_len)
-                        } else {
-                            (((raw_len + half_grid) / snap_grid) * snap_grid).max(min_len)
-                        };
-                        let preview_len = drag_len.min(max_len);
-                        if pitch >= min_note && pitch <= max_note {
-                            let row = (max_note - pitch) as f32;
-                            let y = grid_rect.top() + row * row_height;
-                            let note_pct = (start_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                            let note_x = grid_rect.left() + grid_rect.width() * note_pct;
-                            let note_w = (grid_rect.width() * (preview_len as f32 / total_ticks as f32)).max(6.0);
-                            let ghost_rect = egui::Rect::from_min_size(
-                                egui::pos2(note_x, y + 1.0),
-                                egui::vec2(note_w, row_height - 2.0),
-                            );
-                            grid_painter.rect_filled(ghost_rect, 2.0, egui::Color32::from_rgba_unmultiplied(255, 230, 80, 180));
-                            grid_painter.rect_stroke(ghost_rect, 2.0, egui::Stroke::new(1.5, egui::Color32::YELLOW));
-                        }
-                    }
-                }
-
-                // Shaded inactive area beyond block end
-                if end_x < grid_rect.right() {
-                    let inactive_rect = egui::Rect::from_min_max(
-                        egui::pos2(end_x, grid_rect.top()),
-                        egui::pos2(grid_rect.right(), grid_rect.bottom()),
-                    );
-                    grid_painter.rect_filled(inactive_rect, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110));
-                }
-
-                // Playhead within block
-                let current_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
-                let playhead_tick = {
-                    let sec_pos = self.last_status.as_ref().and_then(|st| {
-                        let mut acc = 0u64;
-                        for s in &st.sections {
-                            if s.id == sec_id {
-                                return Some((acc, s.length_ticks()));
-                            }
-                            acc += s.length_ticks();
-                        }
-                        None
-                    });
-                    if let Some((sec_start, _sec_len)) = sec_pos {
-                        let blk_start = sec_start + block.start_offset_ticks;
-                        let blk_end = blk_start + block.effective_length_ticks();
-                        if current_tick >= blk_start && current_tick < blk_end && block.base_length_ticks > 0 {
-                            Some((current_tick - blk_start) % block.base_length_ticks)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(p_tick) = playhead_tick {
-                    if total_ticks > 0 {
-                        let playhead_pct = (p_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                        let playhead_x = grid_rect.left() + grid_rect.width() * playhead_pct;
-                        grid_painter.line_segment(
-                            [egui::pos2(playhead_x, grid_rect.top()), egui::pos2(playhead_x, grid_rect.bottom())],
-                            egui::Stroke::new(2.5, egui::Color32::WHITE),
-                        );
-                    }
-                }
-
-                // Block End Marker Line & Draggable Badge
-                let marker_color = if is_hovering_badge || is_resizing_block_now {
-                    egui::Color32::from_rgb(255, 90, 90)
-                } else {
-                    egui::Color32::from_rgb(210, 60, 60)
-                };
-                grid_painter.line_segment(
-                    [egui::pos2(end_x, grid_rect.top()), egui::pos2(end_x, grid_rect.bottom())],
-                    egui::Stroke::new(2.0, marker_color),
-                );
-
-                grid_painter.rect_filled(badge_rect, 3.0, marker_color);
-                grid_painter.text(
-                    badge_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "◀ END ▶",
-                    egui::FontId::proportional(10.0),
-                    egui::Color32::WHITE,
-                );
-
-                if is_resizing_block_now {
-                    let current_bars = block.base_length_ticks as f64 / tpb as f64;
-                    let tooltip_text = format!("Block Length: {} ticks ({:.2} bars)", block.base_length_ticks, current_bars);
-                    egui::show_tooltip_text(ui.ctx(), ui.layer_id(), egui::Id::new("piano_roll_resize_tip"), tooltip_text);
-                }
-                    });
-            });
-        });
-    }
-
-    fn render_timeline_block_piano_roll_window(&mut self, ui: &mut egui::Ui, block_id: &str) {
-        let block = match self.last_status.as_ref().and_then(|st| st.timeline_blocks.iter().find(|b| b.id == block_id)).cloned() {
-            Some(b) => b,
-            None => {
-                ui.label("Timeline clip no longer exists.");
-                return;
-            }
-        };
-
-        let track = match self.last_status.as_ref().and_then(|st| st.tracks.iter().find(|t| t.id == block.track_id)).cloned() {
-            Some(t) => t,
-            None => {
-                ui.label("Track no longer exists.");
-                return;
-            }
-        };
-
-        let project_ts = self.last_status.as_ref().map(|s| s.time_signature).unwrap_or_default();
-        let _project_bpm = self.last_status.as_ref().map(|s| s.bpm).unwrap_or(120.0);
-
-        // --- ROW 1: BLOCK PROPERTIES TOOLBAR ---
-        ui.horizontal(|ui| {
-            ui.strong("Clip:");
-            ui.label(egui::RichText::new(&block.id).strong().color(egui::Color32::from_rgb(255, 215, 0)));
-            ui.small(format!("(Track: {})", track.name));
-
-            ui.separator();
-
-            ui.label("Start Tick:");
-            let mut edit_start = block.start_offset_ticks;
-            if ui.add(egui::DragValue::new(&mut edit_start).speed(60.0)).changed() {
-                let mut updated = block.clone();
-                updated.start_offset_ticks = edit_start;
-                self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-            }
-
-            ui.separator();
-
-            let tpb = project_ts.ticks_per_bar().max(1);
-            let tp_beat = project_ts.ticks_per_beat().max(1);
-            let current_bars = (block.base_length_ticks / tpb) as u32;
-            let current_rem_ticks = block.base_length_ticks % tpb;
-            let current_beats = (current_rem_ticks / tp_beat) as u32;
-
-            ui.label("Length:");
-            ui.label("Bars:");
-            let mut edit_bars = current_bars;
-            if ui.add(egui::DragValue::new(&mut edit_bars).range(0..=128)).changed() {
-                let new_len = (edit_bars as u64 * tpb + current_beats as u64 * tp_beat).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-            }
-
-            ui.label("Beats:");
-            let mut edit_beats = current_beats;
-            let max_beats = (project_ts.numerator.saturating_sub(1)).max(1);
-            if ui.add(egui::DragValue::new(&mut edit_beats).range(0..=max_beats)).changed() {
-                let new_len = (current_bars as u64 * tpb + edit_beats as u64 * tp_beat).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-            }
-
-            if ui.small_button("-1 Beat").on_hover_text("Shorten clip by 1 beat").clicked() {
-                let new_len = block.base_length_ticks.saturating_sub(tp_beat).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-            }
-            if ui.small_button("+1 Beat").on_hover_text("Lengthen clip by 1 beat").clicked() {
-                let new_len = block.base_length_ticks + tp_beat;
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-            }
-            if ui.small_button("-1 Bar").on_hover_text("Shorten clip by 1 bar").clicked() {
-                let new_len = block.base_length_ticks.saturating_sub(tpb).max(tp_beat);
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-            }
-            if ui.small_button("+1 Bar").on_hover_text("Lengthen clip by 1 bar").clicked() {
-                let new_len = block.base_length_ticks + tpb;
-                let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
-                self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-            }
-
-            let frac_bars = block.base_length_ticks as f64 / tpb as f64;
-            ui.small(egui::RichText::new(format!("({:.2} bars)", frac_bars)).color(egui::Color32::from_rgb(180, 210, 255)));
-        });
-
-        ui.add_space(3.0);
-
-        let min_note = 12u8; // C0
-        let max_note = 108u8; // C8
-        let num_notes = (max_note - min_note + 1) as usize;
-        let row_height = 14.0f32;
-
-        // --- ROW 2: NOTE TOOLS & OCTAVE NAVIGATION TOOLBAR ---
-        ui.horizontal(|ui| {
-            ui.label("Length:");
-            let durations = [
-                (60u64, "1/64"),
-                (120u64, "1/32"),
-                (240u64, "1/16"),
-                (480u64, "1/8"),
-                (960u64, "1/4"),
-                (1920u64, "1/2"),
-                (3840u64, "1 Bar"),
-            ];
-            for (dur, label) in durations {
-                if ui.selectable_label(self.note_duration_ticks == dur, label).clicked() {
-                    self.note_duration_ticks = dur;
-                }
-            }
-
-            ui.separator();
-            ui.label("Pitch:");
-            let note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-            let octave = (self.piano_roll_note_pitch / 12) as i32 - 1;
-            let note_idx = (self.piano_roll_note_pitch % 12) as usize;
-            ui.strong(format!("{}{}", note_names[note_idx], octave));
-
-            ui.separator();
-            ui.label("Jump:");
-            if ui.small_button("C1").clicked() { self.piano_roll_scroll_y = Some(((max_note - 24) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C2").clicked() { self.piano_roll_scroll_y = Some(((max_note - 36) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C3").clicked() { self.piano_roll_scroll_y = Some(((max_note - 48) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C4").clicked() { self.piano_roll_scroll_y = Some(((max_note - 60) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C5").clicked() { self.piano_roll_scroll_y = Some(((max_note - 72) as f32 * row_height - 180.0).max(0.0)); }
-            if ui.small_button("C6").clicked() { self.piano_roll_scroll_y = Some(((max_note - 84) as f32 * row_height - 180.0).max(0.0)); }
-
-            ui.separator();
-            let pitches: Vec<u8> = block.events.iter().filter_map(|e| {
-                if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = e.action {
-                    Some(note)
-                } else {
-                    None
-                }
-            }).collect();
-
-            if ui.small_button("🎯 Focus Notes").clicked() {
-                if !pitches.is_empty() {
-                    let avg = pitches.iter().map(|&p| p as f32).sum::<f32>() / pitches.len() as f32;
-                    self.piano_roll_scroll_y = Some(((max_note as f32 - avg) * row_height - 180.0).max(0.0));
-                } else {
-                    self.piano_roll_scroll_y = Some(((max_note - 60) as f32 * row_height - 180.0).max(0.0));
-                }
-            }
-
-            ui.separator();
-            ui.label("Zoom:");
-            if ui.small_button("➖").on_hover_text("Zoom out (Ctrl + Wheel Down)").clicked() {
-                self.piano_roll_zoom_x = (self.piano_roll_zoom_x / 1.25).max(0.25);
-            }
-            let zoom_pct = (self.piano_roll_zoom_x * 100.0).round() as i32;
-            if ui.small_button(format!("{}%", zoom_pct)).on_hover_text("Click to reset zoom to 100%").clicked() {
-                self.piano_roll_zoom_x = 1.0;
-            }
-            if ui.small_button("➕").on_hover_text("Zoom in (Ctrl + Wheel Up)").clicked() {
-                self.piano_roll_zoom_x = (self.piano_roll_zoom_x * 1.25).min(8.0);
-            }
-        });
-
-        ui.add_space(4.0);
-
-        let (zoom_delta, ctrl_held) = ui.input(|i| {
-            let ctrl = i.modifiers.ctrl || i.modifiers.command;
-            let factor = if i.zoom_delta() != 1.0 {
-                i.zoom_delta()
-            } else if ctrl && i.raw_scroll_delta.y != 0.0 {
-                if i.raw_scroll_delta.y > 0.0 { 1.15 } else { 1.0 / 1.15 }
-            } else {
-                1.0
-            };
-            (factor, ctrl)
-        });
-
-        if zoom_delta != 1.0 {
-            self.piano_roll_zoom_x = (self.piano_roll_zoom_x * zoom_delta).clamp(0.25, 8.0);
-        }
-
-        let tpb = project_ts.ticks_per_bar().max(1);
-        let tp_beat = project_ts.ticks_per_beat().max(1);
-        let headroom = tpb.max(tp_beat * 2);
-        let view_ticks = block.base_length_ticks + headroom;
-        let total_ticks = view_ticks;
-        let track_events = block.events.clone();
-
-        let mut v_scroll = egui::ScrollArea::vertical()
-            .id_salt("piano_roll_v_scroll_tl")
-            .enable_scrolling(!ctrl_held);
-        if let Some(offset_y) = self.piano_roll_scroll_y.take() {
-            v_scroll = v_scroll.vertical_scroll_offset(offset_y);
-        }
-
-        v_scroll.show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Left Keyboard Column
-                let keyboard_width = 54.0;
-                let (key_rect, key_resp) = ui.allocate_exact_size(
-                    egui::vec2(keyboard_width, num_notes as f32 * row_height),
-                    egui::Sense::click(),
-                );
-
-                let hovered_pitch = ui.input(|i| i.pointer.hover_pos()).and_then(|pos| {
-                    if pos.y >= key_rect.top() && pos.y < key_rect.top() + num_notes as f32 * row_height {
-                        let row_idx = ((pos.y - key_rect.top()) / row_height).floor() as u8;
-                        if (row_idx as usize) < num_notes {
-                            Some(max_note.saturating_sub(row_idx))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-
-                if key_resp.clicked() {
-                    if let Some(pos) = key_resp.interact_pointer_pos() {
-                        let row_idx = ((pos.y - key_rect.top()) / row_height).floor() as u8;
-                        let clicked_pitch = max_note.saturating_sub(row_idx);
-                        self.piano_roll_note_pitch = clicked_pitch;
-                    }
-                }
-
-                let key_painter = ui.painter();
-                let note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-
-                for i in 0..num_notes {
-                    let pitch = max_note - i as u8;
-                    let y = key_rect.top() + i as f32 * row_height;
-                    let r = egui::Rect::from_min_size(egui::pos2(key_rect.left(), y), egui::vec2(keyboard_width, row_height));
-
-                    let is_c = pitch % 12 == 0;
-                    let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
-                    let is_active_pitch = pitch == self.piano_roll_note_pitch;
-                    let is_hovered = hovered_pitch == Some(pitch);
-
-                    let key_bg = if is_active_pitch {
-                        egui::Color32::from_rgb(65, 130, 220)
-                    } else if is_hovered {
-                        if is_black { egui::Color32::from_rgb(50, 58, 75) } else { egui::Color32::from_rgb(255, 255, 190) }
-                    } else if is_c {
-                        egui::Color32::from_rgb(240, 240, 252)
-                    } else if is_black {
-                        egui::Color32::from_rgb(28, 28, 34)
-                    } else {
-                        egui::Color32::from_rgb(215, 215, 222)
-                    };
-                    key_painter.rect_filled(r, 1.0, key_bg);
-
-                    if is_c {
-                        key_painter.line_segment(
-                            [egui::pos2(r.left(), r.bottom()), egui::pos2(r.right(), r.bottom())],
-                            egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 140, 240)),
-                        );
-                    }
-
-                    let name = note_names[(pitch % 12) as usize];
-                    let oct = (pitch / 12) as i32 - 1;
-                    let text_color = if is_active_pitch {
-                        egui::Color32::WHITE
-                    } else if is_hovered {
-                        if is_black { egui::Color32::WHITE } else { egui::Color32::from_rgb(20, 20, 50) }
-                    } else if is_black {
-                        egui::Color32::LIGHT_GRAY
-                    } else if is_c {
-                        egui::Color32::from_rgb(15, 45, 130)
-                    } else {
-                        egui::Color32::BLACK
-                    };
-                    key_painter.text(
-                        egui::pos2(r.left() + 4.0, r.top() + 1.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{}{}", name, oct),
-                        egui::FontId::proportional(if is_c { 10.5 } else { 9.5 }),
-                        text_color,
-                    );
-                }
-
-                // Main Note Grid Canvas
-                egui::ScrollArea::horizontal()
-                    .id_salt("piano_roll_h_scroll_tl")
-                    .show(ui, |ui| {
-                        let avail_w = (ui.available_width() - 20.0).max(650.0);
-                        let grid_width = (avail_w * self.piano_roll_zoom_x).max(200.0);
-                        let (grid_rect, grid_resp) = ui.allocate_exact_size(
-                            egui::vec2(grid_width, num_notes as f32 * row_height),
-                            egui::Sense::click_and_drag(),
-                        );
-
-                        let end_pct = (block.base_length_ticks as f32 / view_ticks as f32).clamp(0.0, 1.0);
-                        let end_x = grid_rect.left() + end_pct * grid_rect.width();
-
-                        let is_resizing_block_now = self.piano_roll_resizing_block.is_some();
-                        let badge_w = 62.0;
-                        let badge_h = 18.0;
-                        let visible_center_y = ui.clip_rect().center().y.clamp(grid_rect.top() + badge_h, grid_rect.bottom() - badge_h);
-                        let badge_rect = egui::Rect::from_min_size(
-                            egui::pos2(end_x + 2.0, visible_center_y - badge_h / 2.0),
-                            egui::vec2(badge_w, badge_h),
-                        );
-                        let is_hovering_badge = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                            badge_rect.contains(pos)
-                        } else {
-                            false
-                        };
-                        if is_hovering_badge || is_resizing_block_now {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                        }
-
-                        // Mouse down: register start of note drag
-                        if grid_resp.drag_started_by(egui::PointerButton::Primary) {
-                            if is_hovering_badge {
-                                self.piano_roll_resizing_block = Some(block.base_length_ticks);
-                                self.drag_start = None;
-                                self.note_move_drag = None;
-                            } else if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                                let clicked_tick = (pct_x * total_ticks as f32) as u64;
-                                let shift_held = ui.input(|i| i.modifiers.shift);
-                                let snap_grid = self.note_duration_ticks.max(10);
-                                let final_tick = if shift_held || self.freehand_drift {
-                                    (clicked_tick as i64 + self.drag_bias_ticks).max(0) as u64
-                                } else {
-                                    (clicked_tick / snap_grid) * snap_grid
-                                };
-                                let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
-                                let clicked_pitch = max_note.saturating_sub(row_idx);
-                                self.piano_roll_note_pitch = clicked_pitch;
-
-                                let clicked_note = block.events.iter().enumerate().find_map(|(i, ev)| {
-                                    if let jamseq::timeline::ScheduledAction::NoteOn { note, velocity } = ev.action {
-                                        if note == clicked_pitch {
-                                            let note_off = block.events.iter().skip(i + 1).find(|off_ev| {
-                                                off_ev.tick > ev.tick
-                                                    && match off_ev.action {
-                                                        jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                        _ => false,
-                                                    }
-                                            });
-                                            let note_off_tick = note_off.map(|off| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                            let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-                                            let end_tick = ev.tick + duration;
-                                            let tolerance = (duration / 4).clamp(1, 15);
-                                            let is_direct_hit = clicked_tick >= ev.tick && clicked_tick < end_tick;
-                                            let is_near_hit = clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick < end_tick;
-                                            let is_hit = if is_direct_hit {
-                                                true
-                                            } else if shift_held || self.freehand_drift {
-                                                is_near_hit
-                                            } else if is_near_hit && (clicked_tick / snap_grid) == (ev.tick / snap_grid) {
-                                                true
-                                            } else {
-                                                false
-                                            };
-                                            if is_hit {
-                                                return Some((ev.id, note_off.map(|off| off.id), ev.tick, duration, note, velocity));
-                                            }
-                                        }
-                                    }
-                                    None
-                                });
-
-                                if let Some((on_id, off_id, orig_tick, duration, orig_pitch, velocity)) = clicked_note {
-                                    let grab_offset = clicked_tick as i64 - orig_tick as i64;
-                                    self.note_move_drag = Some(NoteMoveDragState {
-                                        note_on_id: on_id,
-                                        note_off_id: off_id,
-                                        orig_tick,
-                                        orig_pitch,
-                                        duration,
-                                        grab_offset_ticks: grab_offset,
-                                        velocity,
-                                        current_tick: orig_tick,
-                                        current_pitch: orig_pitch,
-                                    });
-                                    self.drag_start = None;
-                                } else {
-                                    self.note_move_drag = None;
-                                    if final_tick < block.base_length_ticks && !block.has_note_at(clicked_pitch, clicked_tick) && !block.has_note_at(clicked_pitch, final_tick) {
-                                        self.drag_start = Some((final_tick, clicked_pitch));
-                                    } else {
-                                        self.drag_start = None;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Dragging in progress
-                        if grid_resp.dragged() {
-                            if let Some(_initial_len) = self.piano_roll_resizing_block {
-                                if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                    let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.02, 1.0);
-                                    let raw_tick = (pct_x * view_ticks as f32) as u64;
-                                    let shift_held = ui.input(|i| i.modifiers.shift);
-                                    let snapped_tick = if shift_held || self.freehand_drift {
-                                        raw_tick
-                                    } else {
-                                        ((raw_tick + tp_beat / 2) / tp_beat) * tp_beat
-                                    };
-                                    let new_len = snapped_tick.max(tp_beat);
-                                    let mut updated = block.clone();
-                                    updated.base_length_ticks = new_len;
-                                    self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-                                }
-                            } else if let Some(ref mut move_state) = self.note_move_drag {
-                                if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                    let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                                    let pointer_tick = (pct_x * total_ticks as f32) as u64;
-                                    let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
-                                    let new_pitch = max_note.saturating_sub(row_idx);
-
-                                    let unadjusted_tick = (pointer_tick as i64 - move_state.grab_offset_ticks).max(0) as u64;
-                                    let shift_held = ui.input(|i| i.modifiers.shift);
-                                    let snap_grid = self.note_duration_ticks.max(10);
-                                    let snapped_tick = if shift_held || self.freehand_drift {
-                                        unadjusted_tick
-                                    } else {
-                                        (unadjusted_tick / snap_grid) * snap_grid
-                                    };
-                                    let max_tick = block.base_length_ticks.saturating_sub(move_state.duration);
-                                    let clamped_tick = snapped_tick.min(max_tick);
-
-                                    move_state.current_tick = clamped_tick;
-                                    move_state.current_pitch = new_pitch;
-                                }
-                            }
-                        }
-
-                        // Mouse release
-                        if grid_resp.drag_stopped_by(egui::PointerButton::Primary) {
-                            if self.piano_roll_resizing_block.is_some() {
-                                self.piano_roll_resizing_block = None;
-                            } else if let Some(move_state) = self.note_move_drag.take() {
-                                if move_state.current_tick != move_state.orig_tick || move_state.current_pitch != move_state.orig_pitch {
-                                    let mut updated = block.clone();
-                                    updated.events.retain(|e| {
-                                        e.id != move_state.note_on_id && Some(e.id) != move_state.note_off_id
-                                    });
-
-                                    if updated.has_note_at(move_state.current_pitch, move_state.current_tick) {
-                                        self.status_msg = format!("Cannot move: pitch {} is already occupied at tick {}", move_state.current_pitch, move_state.current_tick);
-                                    } else {
-                                        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                        updated.add_note(
-                                            now_ms,
-                                            now_ms + 1,
-                                            move_state.current_tick,
-                                            move_state.duration,
-                                            move_state.current_pitch,
-                                            move_state.velocity,
-                                        );
-                                        self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-                                        self.piano_roll_note_pitch = move_state.current_pitch;
-                                        self.status_msg = format!("Clip '{}': Moved note to pitch {} at tick {}", block.id, move_state.current_pitch, move_state.current_tick);
-                                    }
-                                }
-                            } else if let Some((start_tick, pitch)) = self.drag_start.take() {
-                                if !block.has_note_at(pitch, start_tick) {
-                                    let max_len = if let Some(next_start) = block.next_note_start(pitch, start_tick) {
-                                        next_start.saturating_sub(start_tick)
-                                    } else {
-                                        block.base_length_ticks.saturating_sub(start_tick)
-                                    };
-                                    let shift_held = ui.input(|i| i.modifiers.shift);
-                                    let is_unquantized = shift_held || self.freehand_drift;
-                                    let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
-                                    let snap_grid = self.note_duration_ticks.max(10);
-                                    let half_grid = snap_grid / 2;
-                                    let final_duration = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                        let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                                        let current_tick = (pct_x * total_ticks as f32) as u64;
-                                        if current_tick > start_tick {
-                                            let drag_len = if is_unquantized {
-                                                (current_tick - start_tick).max(min_len)
-                                            } else {
-                                                let raw_len = current_tick - start_tick;
-                                                let snapped = ((raw_len + half_grid) / snap_grid) * snap_grid;
-                                                snapped.max(snap_grid)
-                                            };
-                                            drag_len.min(max_len)
-                                        } else {
-                                            self.note_duration_ticks.min(max_len)
-                                        }
-                                    } else {
-                                        self.note_duration_ticks.min(max_len)
-                                    };
-
-                                    if final_duration > 0 {
-                                        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                        let mut updated = block.clone();
-                                        updated.add_note(now_ms, now_ms + 1, start_tick, final_duration, pitch, 0.9);
-                                        self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-                                        self.piano_roll_note_pitch = pitch;
-                                        self.status_msg = format!("Clip '{}': Added note {} at tick {} (length: {} ticks)", block.id, pitch, start_tick, final_duration);
-                                    }
-                                }
-                            }
-                        } else if grid_resp.clicked_by(egui::PointerButton::Primary) && self.drag_start.is_none() && self.note_move_drag.is_none() && self.piano_roll_resizing_block.is_none() {
-                            if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                                let clicked_tick = (pct_x * total_ticks as f32) as u64;
-                                let shift_held = ui.input(|i| i.modifiers.shift);
-                                let snap_grid = self.note_duration_ticks.max(10);
-                                let final_tick = if shift_held || self.freehand_drift {
-                                    (clicked_tick as i64 + self.drag_bias_ticks).max(0) as u64
-                                } else {
-                                    (clicked_tick / snap_grid) * snap_grid
-                                };
-                                let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
-                                let clicked_pitch = max_note.saturating_sub(row_idx);
-                                self.piano_roll_note_pitch = clicked_pitch;
-
-                                if final_tick >= block.base_length_ticks {
-                                    self.status_msg = format!("Cannot place note past clip end (tick {})", block.base_length_ticks);
-                                } else if block.has_note_at(clicked_pitch, clicked_tick) || block.has_note_at(clicked_pitch, final_tick) {
-                                    self.status_msg = format!("Clip '{}': Note already exists on pitch {} at tick {}", block.id, clicked_pitch, clicked_tick);
-                                } else {
-                                    let max_len = if let Some(next_start) = block.next_note_start(clicked_pitch, final_tick) {
-                                        next_start.saturating_sub(final_tick)
-                                    } else {
-                                        block.base_length_ticks.saturating_sub(final_tick)
-                                    };
-                                    let final_duration = self.note_duration_ticks.min(max_len);
-                                    if final_duration > 0 {
-                                        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                        let mut updated = block.clone();
-                                        updated.add_note(now_ms, now_ms + 1, final_tick, final_duration, clicked_pitch, 0.9);
-                                        self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-                                        self.status_msg = format!("Clip '{}': Added note {} at tick {} (length: {} ticks)", block.id, clicked_pitch, final_tick, final_duration);
-                                    }
-                                }
-                            }
-                        } else if grid_resp.secondary_clicked() {
-                            if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                                let clicked_tick = (pct_x * total_ticks as f32) as u64;
-                                let row_idx = ((pos.y - grid_rect.top()) / row_height).floor() as u8;
-                                let clicked_pitch = max_note.saturating_sub(row_idx);
-
-                                let mut on_idx = None;
-                                let mut off_idx = None;
-
-                                for (i, ev) in block.events.iter().enumerate() {
-                                    if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
-                                        if note == clicked_pitch {
-                                            let note_off = block.events.iter().enumerate().skip(i + 1).find(|(_, off_ev)| {
-                                                off_ev.tick > ev.tick
-                                                    && match off_ev.action {
-                                                        jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                        _ => false,
-                                                    }
-                                            });
-                                            let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                            let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-                                            let end_tick = ev.tick + duration;
-                                            let tolerance = (duration / 4).clamp(1, 15);
-                                            let is_direct_hit = clicked_tick >= ev.tick && clicked_tick < end_tick;
-                                            let is_near_hit = clicked_tick >= ev.tick.saturating_sub(tolerance) && clicked_tick <= end_tick + tolerance;
-                                            if is_direct_hit || is_near_hit {
-                                                on_idx = Some(i);
-                                                off_idx = note_off.map(|(off_i, _)| off_i);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if on_idx.is_none() {
-                                    let mut closest_dist = i64::MAX;
-                                    let max_dist = (self.note_duration_ticks / 2).clamp(10, 60) as i64;
-                                    for (i, ev) in block.events.iter().enumerate() {
-                                        if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
-                                            if note == clicked_pitch {
-                                                let note_off = block.events.iter().enumerate().skip(i + 1).find(|(_, off_ev)| {
-                                                    off_ev.tick > ev.tick
-                                                        && match off_ev.action {
-                                                        jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                        _ => false,
-                                                    }
-                                                });
-                                                let note_off_tick = note_off.map(|(_, off)| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                                let start_dist = (ev.tick as i64 - clicked_tick as i64).abs();
-                                                let end_dist = (note_off_tick as i64 - clicked_tick as i64).abs();
-                                                let d = start_dist.min(end_dist);
-                                                if d <= max_dist && d < closest_dist {
-                                                    closest_dist = d;
-                                                    on_idx = Some(i);
-                                                    off_idx = note_off.map(|(off_i, _)| off_i);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Some(on_i) = on_idx {
-                                    let mut updated = block.clone();
-                                    let mut indices_to_remove = vec![on_i];
-                                    if let Some(off_i) = off_idx {
-                                        indices_to_remove.push(off_i);
-                                    }
-                                    indices_to_remove.sort_unstable_by(|a, b| b.cmp(a));
-                                    for idx in indices_to_remove {
-                                        if idx < updated.events.len() {
-                                            updated.events.remove(idx);
-                                        }
-                                    }
-                                    self.send_cmd(IpcCommand::SetTimelineBlock { block: updated });
-                                    self.status_msg = format!("Clip '{}': Deleted note {} at tick {}", block.id, clicked_pitch, clicked_tick);
-                                }
-                            }
-                        }
-
-                        let grid_painter = ui.painter();
-                        for i in 0..num_notes {
-                            let pitch = max_note - i as u8;
-                            let y = grid_rect.top() + i as f32 * row_height;
-                            let is_black = [1, 3, 6, 8, 10].contains(&(pitch % 12));
-                            let is_c = pitch % 12 == 0;
-                            let row_bg = if is_c {
-                                egui::Color32::from_rgb(32, 38, 55)
-                            } else if is_black {
-                                egui::Color32::from_rgb(22, 24, 30)
-                            } else {
-                                egui::Color32::from_rgb(28, 30, 38)
-                            };
-                            grid_painter.rect_filled(
-                                egui::Rect::from_min_size(egui::pos2(grid_rect.left(), y), egui::vec2(grid_rect.width(), row_height)),
-                                0.0,
-                                row_bg,
-                            );
-                        }
-
-                        let px_per_tick = grid_rect.width() / total_ticks.max(1) as f32;
-                        let grid_step = (self.note_duration_ticks.max(60) as f32 * px_per_tick).max(1.0);
-                        let sub_step = if grid_step < 12.0 {
-                            tp_beat
-                        } else if grid_step < 25.0 {
-                            (self.note_duration_ticks * 2).max(120)
-                        } else {
-                            self.note_duration_ticks.max(60)
-                        };
-
-                        let total_steps = (total_ticks / sub_step).max(1) as usize;
-                        for s in 0..=total_steps {
-                            let tick = s as u64 * sub_step;
-                            let step_pct = tick as f32 / total_ticks as f32;
-                            let x = grid_rect.left() + grid_rect.width() * step_pct;
-                            let is_bar = tick % tpb == 0;
-                            let is_beat = tick % tp_beat == 0;
-                            let (line_color, line_width) = if is_bar {
-                                (egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120), 1.5)
-                            } else if is_beat {
-                                (egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60), 1.0)
-                            } else {
-                                (egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25), 0.5)
-                            };
-                            grid_painter.line_segment(
-                                [egui::pos2(x, grid_rect.top()), egui::pos2(x, grid_rect.bottom())],
-                                egui::Stroke::new(line_width, line_color),
-                            );
-                        }
-
-                        // Draw existing notes
-                        for (i, ev) in track_events.iter().enumerate() {
-                            if let jamseq::timeline::ScheduledAction::NoteOn { note, .. } = ev.action {
-                                if note >= min_note && note <= max_note && total_ticks > 0 {
-                                    let note_off = track_events.iter().skip(i + 1).find(|off_ev| {
-                                        off_ev.tick > ev.tick
-                                            && match off_ev.action {
-                                                jamseq::timeline::ScheduledAction::NoteOff { note: off_n } => off_n == note,
-                                                _ => false,
-                                            }
-                                    });
-                                    let note_off_tick = note_off.map(|off| off.tick).unwrap_or(ev.tick + self.note_duration_ticks);
-                                    let duration = note_off_tick.saturating_sub(ev.tick).max(10);
-
-                                    let row = (max_note - note) as f32;
-                                    let y = grid_rect.top() + row * row_height;
-                                    let note_pct = (ev.tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                                    let note_x = grid_rect.left() + grid_rect.width() * note_pct;
-                                    let note_w = (grid_rect.width() * (duration as f32 / total_ticks as f32)).max(6.0);
-                                    let n_rect = egui::Rect::from_min_size(
-                                        egui::pos2(note_x, y + 1.0),
-                                        egui::vec2(note_w, row_height - 2.0),
-                                    );
-
-                                    let is_being_moved = self.note_move_drag.as_ref().map(|d| d.note_on_id == ev.id).unwrap_or(false);
-                                    let fill_color = if is_being_moved {
-                                        egui::Color32::from_rgba_unmultiplied(90, 190, 255, 50)
-                                    } else {
-                                        egui::Color32::from_rgb(90, 190, 255)
-                                    };
-                                    let stroke = if is_being_moved {
-                                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50))
-                                    } else {
-                                        egui::Stroke::new(1.0, egui::Color32::WHITE)
-                                    };
-
-                                    grid_painter.rect_filled(n_rect, 2.0, fill_color);
-                                    grid_painter.rect_stroke(n_rect, 2.0, stroke);
-                                }
-                            }
-                        }
-
-                        // Draw ghost preview for note being moved
-                        if let Some(ref move_state) = self.note_move_drag {
-                            if move_state.current_pitch >= min_note && move_state.current_pitch <= max_note && total_ticks > 0 {
-                                let row = (max_note - move_state.current_pitch) as f32;
-                                let y = grid_rect.top() + row * row_height;
-                                let note_pct = (move_state.current_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                                let note_x = grid_rect.left() + grid_rect.width() * note_pct;
-                                let note_w = (grid_rect.width() * (move_state.duration as f32 / total_ticks as f32)).max(6.0);
-                                let move_rect = egui::Rect::from_min_size(
-                                    egui::pos2(note_x, y + 1.0),
-                                    egui::vec2(note_w, row_height - 2.0),
-                                );
-                                grid_painter.rect_filled(move_rect, 2.0, egui::Color32::from_rgba_unmultiplied(255, 215, 0, 200));
-                                grid_painter.rect_stroke(move_rect, 2.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
-                            }
-                        }
-
-                        // Draw live dragging preview for newly drawn note
-                        if let Some((start_tick, pitch)) = self.drag_start {
-                            if pitch >= min_note && pitch <= max_note && total_ticks > 0 {
-                                let preview_len = if let Some(pos) = grid_resp.interact_pointer_pos() {
-                                    let pct_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
-                                    let cur_tick = (pct_x * total_ticks as f32) as u64;
-                                    let shift_held = ui.input(|i| i.modifiers.shift);
-                                    let is_unquantized = shift_held || self.freehand_drift;
-                                    let min_len = if is_unquantized { 10u64 } else { self.note_duration_ticks };
-                                    let snap_grid = self.note_duration_ticks.max(10);
-                                    let half_grid = snap_grid / 2;
-                                    if cur_tick > start_tick {
-                                        let raw_len = cur_tick - start_tick;
-                                        if is_unquantized {
-                                            raw_len.max(min_len)
-                                        } else {
-                                            let snapped = ((raw_len + half_grid) / snap_grid) * snap_grid;
-                                            snapped.max(snap_grid)
-                                        }
-                                    } else {
-                                        self.note_duration_ticks
-                                    }
-                                } else {
-                                    self.note_duration_ticks
-                                };
-
-                                let row = (max_note - pitch) as f32;
-                                let y = grid_rect.top() + row * row_height;
-                                let note_pct = (start_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                                let note_x = grid_rect.left() + grid_rect.width() * note_pct;
-                                let note_w = (grid_rect.width() * (preview_len as f32 / total_ticks as f32)).max(6.0);
-                                let drag_rect = egui::Rect::from_min_size(
-                                    egui::pos2(note_x, y + 1.0),
-                                    egui::vec2(note_w, row_height - 2.0),
-                                );
-                                grid_painter.rect_filled(drag_rect, 2.0, egui::Color32::from_rgba_unmultiplied(100, 255, 100, 150));
-                                grid_painter.rect_stroke(drag_rect, 2.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(150, 255, 150)));
-                            }
-                        }
-
-                        // Keyboard navigation & playback shortcuts
-                        if ui.input(|i| i.key_pressed(egui::Key::Space)) {
-                            let is_playing = self.last_status.as_ref().map(|s| s.is_playing).unwrap_or(false);
-                            if is_playing {
-                                self.send_cmd(IpcCommand::Pause);
-                            } else {
-                                self.send_cmd(IpcCommand::Play);
-                            }
-                        }
-
-                        // Playhead line synchronized to timeline
-                        let playhead_tick = self.last_status.as_ref().and_then(|s| {
-                            if s.current_tick >= block.start_offset_ticks && s.current_tick < block.start_offset_ticks + block.base_length_ticks {
-                                Some(s.current_tick - block.start_offset_ticks)
-                            } else {
-                                None
-                            }
-                        });
-
-                        if let Some(p_tick) = playhead_tick {
-                            if total_ticks > 0 {
-                                let playhead_pct = (p_tick as f32 / total_ticks as f32).clamp(0.0, 1.0);
-                                let playhead_x = grid_rect.left() + grid_rect.width() * playhead_pct;
-                                grid_painter.line_segment(
-                                    [egui::pos2(playhead_x, grid_rect.top()), egui::pos2(playhead_x, grid_rect.bottom())],
-                                    egui::Stroke::new(2.5, egui::Color32::WHITE),
-                                );
-                            }
-                        }
-
-                        // Block End Marker Line & Draggable Badge
-                        let marker_color = if is_hovering_badge || is_resizing_block_now {
-                            egui::Color32::from_rgb(255, 90, 90)
-                        } else {
-                            egui::Color32::from_rgb(210, 60, 60)
-                        };
-                        grid_painter.line_segment(
-                            [egui::pos2(end_x, grid_rect.top()), egui::pos2(end_x, grid_rect.bottom())],
-                            egui::Stroke::new(2.0, marker_color),
-                        );
-
-                        grid_painter.rect_filled(badge_rect, 3.0, marker_color);
-                        grid_painter.text(
-                            badge_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "◀ END ▶",
-                            egui::FontId::proportional(10.0),
-                            egui::Color32::WHITE,
-                        );
-
-                        if is_resizing_block_now {
-                            let current_bars = block.base_length_ticks as f64 / tpb as f64;
-                            let tooltip_text = format!("Clip Length: {} ticks ({:.2} bars)", block.base_length_ticks, current_bars);
-                            egui::show_tooltip_text(ui.ctx(), ui.layer_id(), egui::Id::new("piano_roll_resize_tip_tl"), tooltip_text);
-                        }
-                    });
-            });
         });
     }
 }
