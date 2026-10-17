@@ -101,7 +101,8 @@ pub fn render_grouped_parameter_list<F>(
                                 let mut val = param.value.round() as i64;
                                 let min_i = param.min.round() as i64;
                                 let max_i = param.max.round() as i64;
-                                if ui.add(egui::Slider::new(&mut val, min_i..=max_i).step_by(1.0)).changed() {
+                                let resp = ui.add(egui::Slider::new(&mut val, min_i..=max_i).step_by(1.0));
+                                if resp.changed() || resp.drag_stopped() {
                                     on_change(&param.name, val as f32);
                                 }
                                 if let Some(ref disp) = param.display_value {
@@ -110,7 +111,8 @@ pub fn render_grouped_parameter_list<F>(
                             }
                             ParamType::Float => {
                                 let mut val = param.value;
-                                if ui.add(egui::Slider::new(&mut val, param.min..=param.max)).changed() {
+                                let resp = ui.add(egui::Slider::new(&mut val, param.min..=param.max));
+                                if resp.changed() || resp.drag_stopped() {
                                     on_change(&param.name, val);
                                 }
                                 if let Some(ref disp) = param.display_value {
