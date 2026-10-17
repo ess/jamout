@@ -1,6 +1,6 @@
 use eframe::egui;
 use jamseq::ipc::IpcCommand;
-use jamseq::timeline::{LoopMode, TempoOverride, TrackArrangerMode, TrackBlock};
+use jamseq::timeline::{TempoOverride, TrackArrangerMode, TrackBlock};
 use crate::{
     compute_section_col_width, BlockDragKind, BlockDragState, JamOutApp, OpenPianoRollTarget,
     TimelineBlockDragState, SECTION_HEADER_HEIGHT, TRACK_HEADER_WIDTH, TRACK_ROW_HEIGHT,
@@ -312,7 +312,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                     // Render timeline blocks
                     for block in &track_timeline_blocks {
                         let s_pct = (block.start_offset_ticks as f32 / total_timeline_ticks as f32).clamp(0.0, 1.0);
-                        let l_pct = (block.base_length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
+                        let l_pct = (block.length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
                         let bx = lane_rect.left() + s_pct * lane_rect.width();
                         let bw = (l_pct * lane_rect.width()).max(48.0).min(lane_rect.right() - bx);
                         let block_rect = egui::Rect::from_min_size(
@@ -411,7 +411,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                         // Note event previews
                         for ev in &block.events {
                             if let jamseq::timeline::ScheduledAction::NoteOn { .. } = ev.action {
-                                let ev_pct = (ev.tick as f32 / block.base_length_ticks.max(1) as f32).clamp(0.0, 1.0);
+                                let ev_pct = (ev.tick as f32 / block.length_ticks.max(1) as f32).clamp(0.0, 1.0);
                                 let nx = block_rect.left() + ev_pct * block_rect.width();
                                 painter.line_segment(
                                     [egui::pos2(nx, block_rect.top() + 18.0), egui::pos2(nx, block_rect.bottom() - 6.0)],
@@ -426,14 +426,14 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                         if let Some(pos) = pointer_pos {
                             if let Some(hit_block) = track_timeline_blocks.iter().find(|b| {
                                 let s_pct = (b.start_offset_ticks as f32 / total_timeline_ticks as f32).clamp(0.0, 1.0);
-                                let l_pct = (b.base_length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
+                                let l_pct = (b.length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
                                 let bx = lane_rect.left() + s_pct * lane_rect.width();
                                 let bw = (l_pct * lane_rect.width()).max(48.0).min(lane_rect.right() - bx);
                                 let r = egui::Rect::from_min_size(egui::pos2(bx, lane_rect.top() + 4.0), egui::vec2(bw, lane_rect.height() - 8.0));
                                 r.contains(pos)
                             }) {
                                 let s_pct = (hit_block.start_offset_ticks as f32 / total_timeline_ticks as f32).clamp(0.0, 1.0);
-                                let l_pct = (hit_block.base_length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
+                                let l_pct = (hit_block.length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
                                 let bx = lane_rect.left() + s_pct * lane_rect.width();
                                 let bw = (l_pct * lane_rect.width()).max(48.0).min(lane_rect.right() - bx);
                                 let r = egui::Rect::from_min_size(egui::pos2(bx, lane_rect.top() + 4.0), egui::vec2(bw, lane_rect.height() - 8.0));
@@ -450,7 +450,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                                     block_id: hit_block.id.clone(),
                                     track_id: track.id.clone(),
                                     initial_start_tick: hit_block.start_offset_ticks,
-                                    initial_length_ticks: hit_block.base_length_ticks,
+                                    initial_length_ticks: hit_block.length_ticks,
                                     start_pos_x: pos.x,
                                     kind,
                                 });
@@ -478,7 +478,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                                         match drag.kind {
                                             BlockDragKind::Resize => {
                                                 let new_len = (drag.initial_length_ticks as i64 + snapped_delta).max(240) as u64;
-                                                block.base_length_ticks = new_len;
+                                                block.length_ticks = new_len;
                                                 app.send_cmd(IpcCommand::UpdateBlock { block });
                                             }
                                             BlockDragKind::Slip => {
@@ -507,7 +507,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                         if let Some(pos) = pointer_pos {
                             let hit = track_timeline_blocks.iter().find(|b| {
                                 let s_pct = (b.start_offset_ticks as f32 / total_timeline_ticks as f32).clamp(0.0, 1.0);
-                                let l_pct = (b.base_length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
+                                let l_pct = (b.length_ticks as f32 / total_timeline_ticks as f32).max(0.005);
                                 let bx = lane_rect.left() + s_pct * lane_rect.width();
                                 let bw = (l_pct * lane_rect.width()).max(48.0).min(lane_rect.right() - bx);
                                 let r = egui::Rect::from_min_size(egui::pos2(bx, lane_rect.top() + 4.0), egui::vec2(bw, lane_rect.height() - 8.0));
@@ -703,20 +703,6 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                                 egui::Color32::WHITE,
                             );
 
-                            // Loop Mode & Metric Modulation Badges
-                            let mode_pill = match block.loop_mode {
-                                LoopMode::OneShot => "1x",
-                                LoopMode::LoopToSection => "Loop",
-                                LoopMode::FixedLoops(n) => if n == 2 { "2x" } else { "4x" },
-                            };
-                            painter.text(
-                                egui::pos2(del_btn_rect.left() - 4.0, block_rect.top() + 4.0),
-                                egui::Align2::RIGHT_TOP,
-                                mode_pill,
-                                egui::FontId::monospace(10.0),
-                                egui::Color32::from_rgb(200, 220, 255),
-                            );
-
                             if let Some(t_override) = block.tempo {
                                 let badge_str = match t_override {
                                     TempoOverride::Ratio(n, d) => format!("{}:{}", n, d),
@@ -745,7 +731,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                             // Miniature Note Previews
                             for ev in &block.events {
                                 if let jamseq::timeline::ScheduledAction::NoteOn { .. } = ev.action {
-                                    let ev_pct = (ev.tick as f32 / block.base_length_ticks.max(1) as f32).clamp(0.0, 1.0);
+                                    let ev_pct = (ev.tick as f32 / block.length_ticks.max(1) as f32).clamp(0.0, 1.0);
                                     let nx = block_rect.left() + ev_pct * block_rect.width();
                                     painter.line_segment(
                                         [egui::pos2(nx, block_rect.top() + 18.0), egui::pos2(nx, block_rect.bottom() - 6.0)],
@@ -785,7 +771,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                                         section_id: sec.id.clone(),
                                         track_id: track.id.clone(),
                                         initial_offset: block.start_offset_ticks,
-                                        initial_length: block.base_length_ticks,
+                                        initial_length: block.length_ticks,
                                         start_pos_x: start_pos,
                                         kind,
                                     });
@@ -812,7 +798,7 @@ pub fn render_arranger(app: &mut JamOutApp, ui: &mut egui::Ui) {
                                                     };
                                                     let new_length = (drag.initial_length as i64 + snapped_delta).max(tp_beat as i64) as u64;
                                                     let mut updated = block.clone();
-                                                    updated.base_length_ticks = new_length;
+                                                    updated.length_ticks = new_length;
                                                     app.send_cmd(IpcCommand::UpdateBlock {
                                                         block: updated,
                                                     });

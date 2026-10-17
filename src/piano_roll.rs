@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 use eframe::egui;
 use jamseq::ipc::{IpcCommand, IpcStatusResponse};
-use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TimeSignature, TrackBlock};
+use jamseq::timeline::{SongSection, TempoOverride, TimeSignature, TrackBlock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenPianoRollTarget {
@@ -190,47 +190,11 @@ impl PianoRollState {
 
             ui.separator();
 
-            // Loop Mode
-            ui.label("Loop:");
-            let loop_label = match block.loop_mode {
-                LoopMode::OneShot => "One-Shot (1x)",
-                LoopMode::FixedLoops(2) => "Repeat 2x",
-                LoopMode::FixedLoops(4) => "Repeat 4x",
-                LoopMode::LoopToSection => "Loop to Section",
-                LoopMode::FixedLoops(_) => "Custom Loop",
-            };
-            egui::ComboBox::from_id_salt(format!("blk_loop_combo_{}_{}", block_id, track_id))
-                .selected_text(loop_label)
-                .show_ui(ui, |ui| {
-                    if ui.selectable_label(block.loop_mode == LoopMode::OneShot, "One-Shot (1x)").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::OneShot;
-                        let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
-                    }
-                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(2), "Repeat 2x").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::FixedLoops(2);
-                        let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
-                    }
-                    if ui.selectable_label(block.loop_mode == LoopMode::FixedLoops(4), "Repeat 4x").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::FixedLoops(4);
-                        let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
-                    }
-                    if ui.selectable_label(block.loop_mode == LoopMode::LoopToSection, "Loop to Section").clicked() {
-                        let mut updated = block.clone();
-                        updated.loop_mode = LoopMode::LoopToSection;
-                        let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
-                    }
-                });
-
-            ui.separator();
-
-            // Base Length in Bars & Beats
+            // Length in Bars & Beats
             let tpb = eff_block_ts.ticks_per_bar().max(1);
             let tp_beat = eff_block_ts.ticks_per_beat().max(1);
-            let current_bars = (block.base_length_ticks / tpb) as u32;
-            let current_rem_ticks = block.base_length_ticks % tpb;
+            let current_bars = (block.length_ticks / tpb) as u32;
+            let current_rem_ticks = block.length_ticks % tpb;
             let current_beats = (current_rem_ticks / tp_beat) as u32;
 
             ui.label("Length:");
@@ -239,7 +203,7 @@ impl PianoRollState {
             if ui.add(egui::DragValue::new(&mut edit_bars).range(0..=128)).changed() {
                 let new_len = (edit_bars as u64 * tpb + current_beats as u64 * tp_beat).max(tp_beat);
                 let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
+                updated.length_ticks = new_len;
                 let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
             }
 
@@ -249,36 +213,36 @@ impl PianoRollState {
             if ui.add(egui::DragValue::new(&mut edit_beats).range(0..=max_beats)).changed() {
                 let new_len = (current_bars as u64 * tpb + edit_beats as u64 * tp_beat).max(tp_beat);
                 let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
+                updated.length_ticks = new_len;
                 let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
             }
 
             if ui.small_button("-1 Beat").on_hover_text("Shorten block by 1 beat").clicked() {
-                let new_len = block.base_length_ticks.saturating_sub(tp_beat).max(tp_beat);
+                let new_len = block.length_ticks.saturating_sub(tp_beat).max(tp_beat);
                 let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
+                updated.length_ticks = new_len;
                 let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
             }
             if ui.small_button("+1 Beat").on_hover_text("Lengthen block by 1 beat").clicked() {
-                let new_len = block.base_length_ticks + tp_beat;
+                let new_len = block.length_ticks + tp_beat;
                 let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
+                updated.length_ticks = new_len;
                 let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
             }
             if ui.small_button("-1 Bar").on_hover_text("Shorten block by 1 bar").clicked() {
-                let new_len = block.base_length_ticks.saturating_sub(tpb).max(tp_beat);
+                let new_len = block.length_ticks.saturating_sub(tpb).max(tp_beat);
                 let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
+                updated.length_ticks = new_len;
                 let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
             }
             if ui.small_button("+1 Bar").on_hover_text("Lengthen block by 1 bar").clicked() {
-                let new_len = block.base_length_ticks + tpb;
+                let new_len = block.length_ticks + tpb;
                 let mut updated = block.clone();
-                updated.base_length_ticks = new_len;
+                updated.length_ticks = new_len;
                 let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
             }
 
-            let frac_bars = block.base_length_ticks as f64 / tpb as f64;
+            let frac_bars = block.length_ticks as f64 / tpb as f64;
             ui.small(egui::RichText::new(format!("({:.2} bars)", frac_bars)).color(egui::Color32::from_rgb(180, 210, 255)));
         });
 
@@ -356,7 +320,7 @@ impl PianoRollState {
             self.zoom_x = (self.zoom_x * zoom_delta).clamp(0.25, 8.0);
         }
 
-        let total_ticks = block.base_length_ticks;
+        let total_ticks = block.length_ticks;
         let view_ticks = total_ticks.max(3840);
         let avail_w = ui.available_width() - 52.0;
         let key_width = 44.0;
@@ -456,7 +420,7 @@ impl PianoRollState {
                     );
 
                     let tp_beat = eff_block_ts.ticks_per_beat().max(1);
-                    let end_x = grid_rect.left() + (block.base_length_ticks as f32 / view_ticks as f32).clamp(0.0, 1.0) * grid_rect.width();
+                    let end_x = grid_rect.left() + (block.length_ticks as f32 / view_ticks as f32).clamp(0.0, 1.0) * grid_rect.width();
 
                     let badge_rect = egui::Rect::from_center_size(
                         egui::pos2(end_x, grid_rect.top() + 10.0),
@@ -472,7 +436,7 @@ impl PianoRollState {
                     if grid_resp.drag_started_by(egui::PointerButton::Primary) {
                         if let Some(pos) = grid_resp.interact_pointer_pos() {
                             if badge_rect.contains(pos) || (pos.x >= end_x - 6.0 && pos.x <= end_x + 6.0) {
-                                self.resizing_block = Some(block.base_length_ticks);
+                                self.resizing_block = Some(block.length_ticks);
                                 self.drag_start = None;
                                 self.note_move_drag = None;
                             } else {
@@ -528,7 +492,7 @@ impl PianoRollState {
                                     self.drag_start = None;
                                 } else {
                                     self.note_move_drag = None;
-                                    if final_tick < block.base_length_ticks && !block.has_note_at(clicked_pitch, clicked_tick) && !block.has_note_at(clicked_pitch, final_tick) {
+                                    if final_tick < block.length_ticks && !block.has_note_at(clicked_pitch, clicked_tick) && !block.has_note_at(clicked_pitch, final_tick) {
                                         self.drag_start = Some((final_tick, clicked_pitch));
                                     } else {
                                         self.drag_start = None;
@@ -552,7 +516,7 @@ impl PianoRollState {
                                 };
                                 let new_len = snapped_tick.max(tp_beat);
                                 let mut updated = block.clone();
-                                updated.base_length_ticks = new_len;
+                                updated.length_ticks = new_len;
                                 let _ = cmd_sender.send(IpcCommand::UpdateBlock { block: updated });
                             }
                         } else if let Some(ref mut move_state) = self.note_move_drag {
@@ -570,7 +534,7 @@ impl PianoRollState {
                                 } else {
                                     (unadjusted_tick / snap_grid) * snap_grid
                                 };
-                                let max_tick = block.base_length_ticks.saturating_sub(move_state.duration);
+                                let max_tick = block.length_ticks.saturating_sub(move_state.duration);
                                 let clamped_tick = snapped_tick.min(max_tick);
 
                                 move_state.current_tick = clamped_tick;
@@ -612,7 +576,7 @@ impl PianoRollState {
                                 let max_len = if let Some(next_start) = block.next_note_start(pitch, start_tick) {
                                     next_start.saturating_sub(start_tick)
                                 } else {
-                                    block.base_length_ticks.saturating_sub(start_tick)
+                                    block.length_ticks.saturating_sub(start_tick)
                                 };
                                 let shift_held = ui.input(|i| i.modifiers.shift);
                                 let is_unquantized = shift_held || self.freehand_drift;
@@ -662,15 +626,15 @@ impl PianoRollState {
                                 let clicked_pitch = max_note.saturating_sub(row_idx);
                                 self.note_pitch = clicked_pitch;
 
-                                if final_tick >= block.base_length_ticks {
-                                    on_action(PianoRollAction::StatusMsg(format!("Cannot place note past block end (tick {})", block.base_length_ticks)));
+                                if final_tick >= block.length_ticks {
+                                    on_action(PianoRollAction::StatusMsg(format!("Cannot place note past block end (tick {})", block.length_ticks)));
                                 } else if block.has_note_at(clicked_pitch, clicked_tick) || block.has_note_at(clicked_pitch, final_tick) {
                                     on_action(PianoRollAction::StatusMsg(format!("Block '{}': Note already exists on pitch {} at tick {}", block.id, clicked_pitch, clicked_tick)));
                                 } else {
                                     let max_len = if let Some(next_start) = block.next_note_start(clicked_pitch, final_tick) {
                                         next_start.saturating_sub(final_tick)
                                     } else {
-                                        block.base_length_ticks.saturating_sub(final_tick)
+                                        block.length_ticks.saturating_sub(final_tick)
                                     };
                                     let final_duration = self.note_duration_ticks.min(max_len);
                                     if final_duration > 0 {
@@ -933,8 +897,8 @@ impl PianoRollState {
                         if let Some((_, sec_start, _)) = sec_pos {
                             let blk_start = sec_start + block.start_offset_ticks;
                             let blk_end = blk_start + block.effective_length_ticks();
-                            if current_tick >= blk_start && current_tick < blk_end && block.base_length_ticks > 0 {
-                                Some((current_tick - blk_start) % block.base_length_ticks)
+                            if current_tick >= blk_start && current_tick < blk_end && block.length_ticks > 0 {
+                                Some(current_tick - blk_start)
                             } else {
                                 None
                             }
@@ -944,8 +908,8 @@ impl PianoRollState {
                     } else {
                         let blk_start = block.start_offset_ticks;
                         let blk_end = blk_start + block.effective_length_ticks();
-                        if current_tick >= blk_start && current_tick < blk_end && block.base_length_ticks > 0 {
-                            Some((current_tick - blk_start) % block.base_length_ticks)
+                        if current_tick >= blk_start && current_tick < blk_end && block.length_ticks > 0 {
+                            Some(current_tick - blk_start)
                         } else {
                             None
                         }
@@ -983,8 +947,8 @@ impl PianoRollState {
                     );
 
                     if is_resizing_block_now {
-                        let current_bars = block.base_length_ticks as f64 / tp_beat as f64 / eff_block_ts.numerator as f64;
-                        let tooltip_text = format!("Block Length: {} ticks ({:.2} bars)", block.base_length_ticks, current_bars);
+                        let current_bars = block.length_ticks as f64 / tp_beat as f64 / eff_block_ts.numerator as f64;
+                        let tooltip_text = format!("Block Length: {} ticks ({:.2} bars)", block.length_ticks, current_bars);
                         egui::show_tooltip_text(ui.ctx(), ui.layer_id(), egui::Id::new("piano_roll_resize_tip"), tooltip_text);
                     }
                 });

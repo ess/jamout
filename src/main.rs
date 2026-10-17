@@ -71,7 +71,6 @@ pub struct JamOutApp {
     pub status_msg: String,
     pub _status_time: Instant,
     pub active_tab: Tab,
-    pub lyrics: Vec<LyricLine>,
 
     // Human drift & feel controls
     pub _drift_ticks: i64,
@@ -140,12 +139,6 @@ pub struct JamOutApp {
 pub enum Tab {
     Timeline,
     Mixer,
-    Teleprompter,
-}
-
-pub struct LyricLine {
-    pub bar: u32,
-    pub text: &'static str,
 }
 
 impl JamOutApp {
@@ -321,14 +314,6 @@ impl JamOutApp {
             }
         });
 
-        let lyrics = vec![
-            LyricLine { bar: 1, text: "(Intro 808 glide & gothic choir fade-in)" },
-            LyricLine { bar: 5, text: "Ash in the basin, frost on the sill..." },
-            LyricLine { bar: 7, text: "A breath caught in bronze when the bells fell still." },
-            LyricLine { bar: 9, text: "I did not ask the dark to spare the flame..." },
-            LyricLine { bar: 11, text: "Only to teach the iron how to speak my name." },
-        ];
-
         Self {
             _socket_path: socket_path,
             connected: false,
@@ -339,7 +324,6 @@ impl JamOutApp {
             status_msg: "Ready. Connect jamseq via /tmp/jamseq.sock".to_string(),
             _status_time: Instant::now(),
             active_tab: Tab::Timeline,
-            lyrics,
             _drift_ticks: 20,       // ±20 ticks Gaussian feel
             drag_bias_ticks: 0,    // Default 0 ticks (strict grid alignment)
             freehand_drift: false,
@@ -599,7 +583,6 @@ impl eframe::App for JamOutApp {
                 ui.add(progress_bar);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.active_tab, Tab::Teleprompter, "🎙 Lyrics");
                     ui.selectable_value(&mut self.active_tab, Tab::Mixer, "🎚 Mixer");
                     ui.selectable_value(&mut self.active_tab, Tab::Timeline, "📊 Arranger");
                 });
@@ -1010,7 +993,6 @@ impl eframe::App for JamOutApp {
             match self.active_tab {
                 Tab::Timeline => self.render_timeline_view(ui),
                 Tab::Mixer => self.render_mixer_view(ui),
-                Tab::Teleprompter => self.render_teleprompter_view(ui),
             }
         });
 
@@ -1363,40 +1345,5 @@ impl JamOutApp {
 
     fn render_mixer_view(&mut self, ui: &mut egui::Ui) {
         mixer::render_mixer(self, ui);
-    }
-
-    fn render_teleprompter_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Lyric Teleprompter (Synced Recording Mode)");
-        ui.add_space(8.0);
-
-        let current_tick = self.last_status.as_ref().map(|s| s.current_tick).unwrap_or(0);
-        let current_bar = (current_tick / (4 * 960)) + 1;
-
-        ui.label("Synchronized vocal recording prompter. Highlights current bar during take:");
-        ui.add_space(12.0);
-
-        for line in &self.lyrics {
-            let is_active = (current_bar as i32 - line.bar as i32).abs() < 2;
-            let text_format = if is_active {
-                egui::RichText::new(format!("Bar {:02}:  {}", line.bar, line.text))
-                    .size(24.0)
-                    .strong()
-                    .color(egui::Color32::from_rgb(255, 230, 100))
-            } else {
-                egui::RichText::new(format!("Bar {:02}:  {}", line.bar, line.text))
-                    .size(18.0)
-                    .color(egui::Color32::GRAY)
-            };
-
-            ui.label(text_format);
-            ui.add_space(6.0);
-        }
-
-        ui.add_space(20.0);
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Save Take To:");
-            ui.text_edit_singleline(&mut self.record_out_filename);
-        });
     }
 }
