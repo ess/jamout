@@ -195,10 +195,10 @@ pub fn render_mixer(app: &mut JamOutApp, ui: &mut egui::Ui) {
                                     app.edit_track_id = Some(track.id.clone());
                                 }
                                 if idx > 0 && ui.small_button("▲").on_hover_text("Move track up").clicked() {
-                                    app.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx - 1 });
+                                    app.send_cmd(IpcCommand::ReorderTrack { from_index: idx, to_index: idx - 1 });
                                 }
                                 if idx + 1 < tracks.len() && ui.small_button("▼").on_hover_text("Move track down").clicked() {
-                                    app.send_cmd(IpcCommand::ReorderTrack { from: idx, to: idx + 1 });
+                                    app.send_cmd(IpcCommand::ReorderTrack { from_index: idx, to_index: idx + 1 });
                                 }
                                 if ui.small_button("🗑").on_hover_text("Delete track").clicked() {
                                     app.send_cmd(IpcCommand::DeleteTrack { track_id: track.id.clone() });
