@@ -424,6 +424,51 @@ impl JamOutApp {
             self.prompt_save_project_as();
         }
     }
+
+    pub fn prompt_import_midi(&mut self, target_track_id: Option<String>, target_section_id: Option<String>) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Import Standard MIDI File (.mid)")
+            .add_filter("Standard MIDI File (*.mid, *.midi)", &["mid", "midi"]);
+
+        if let Some(path) = dialog.pick_file() {
+            let path_str = path.to_string_lossy().to_string();
+            self.send_cmd(IpcCommand::ImportMidiFile {
+                file_path: path_str.clone(),
+                target_track_id,
+                target_section_id,
+            });
+            self.status_msg = format!("Imported MIDI: {}", path_str);
+        }
+    }
+
+    pub fn prompt_export_midi(&mut self) {
+        let default_name = self.last_status.as_ref()
+            .map(|s| {
+                let title = s.project_title.trim();
+                if title.is_empty() || title == "Untitled" {
+                    "arrangement".to_string()
+                } else {
+                    title.replace(' ', "_").to_lowercase()
+                }
+            })
+            .unwrap_or_else(|| "arrangement".to_string());
+        let default_file = format!("{}.mid", default_name);
+
+        let dialog = rfd::FileDialog::new()
+            .set_title("Export Arrangement as Standard MIDI File (.mid)")
+            .set_file_name(&default_file)
+            .add_filter("Standard MIDI File (*.mid)", &["mid", "midi"]);
+
+        if let Some(path) = dialog.save_file() {
+            let mut normalized = path.clone();
+            if normalized.extension().and_then(|e| e.to_str()) != Some("mid") {
+                normalized.set_extension("mid");
+            }
+            let path_str = normalized.to_string_lossy().to_string();
+            self.send_cmd(IpcCommand::ExportMidiFile { file_path: path_str.clone() });
+            self.status_msg = format!("Exported MIDI to: {}", path_str);
+        }
+    }
 }
 
 fn normalize_jam_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -491,6 +536,12 @@ impl eframe::App for JamOutApp {
                 }
                 if ui.small_button("💾").on_hover_text("Save Project (Ctrl+S)").clicked() {
                     self.save_project_quick();
+                }
+                if ui.small_button("📥 MIDI").on_hover_text("Import Standard MIDI File (.mid)...").clicked() {
+                    self.prompt_import_midi(None, None);
+                }
+                if ui.small_button("📤 MIDI").on_hover_text("Export Arrangement to Standard MIDI File (.mid)...").clicked() {
+                    self.prompt_export_midi();
                 }
 
                 ui.separator();
@@ -644,6 +695,14 @@ impl eframe::App for JamOutApp {
 
                         if ui.button("💾 Save As... (Ctrl+Shift+S)").clicked() {
                             self.prompt_save_project_as();
+                        }
+
+                        if ui.button("📥 Import MIDI...").clicked() {
+                            self.prompt_import_midi(None, None);
+                        }
+
+                        if ui.button("📤 Export MIDI...").clicked() {
+                            self.prompt_export_midi();
                         }
 
                         if ui.button("Close").clicked() {
